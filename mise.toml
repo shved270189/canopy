@@ -1,0 +1,6 @@
+[tools]
+node = "24"
+rust = "1.94.1"
+
+[env]
+_.path = ["{{config_root}}/node_modules/.bin"]
