@@ -254,8 +254,9 @@ export function ProjectSidebar({ selection, onSelect }: ProjectSidebarProps) {
     }
   }, [projectsReady, projectPathsKey, loadWorktrees, projects]);
 
+  // Pause poll while Add worktree modal open so modal list stays stable.
   useEffect(() => {
-    if (!projectsReady || projects.length === 0) return;
+    if (!projectsReady || projects.length === 0 || addForProject) return;
 
     const id = window.setInterval(() => {
       void refreshAllProjects();
@@ -278,7 +279,7 @@ export function ProjectSidebar({ selection, onSelect }: ProjectSidebarProps) {
       window.removeEventListener("focus", onFocus);
       document.removeEventListener("visibilitychange", onVisibility);
     };
-  }, [projectsReady, projects.length, refreshAllProjects]);
+  }, [projectsReady, projects.length, refreshAllProjects, addForProject]);
 
   function clearSelectionIfProject(project: Project) {
     const sel = selectionRef.current;

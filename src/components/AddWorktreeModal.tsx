@@ -22,17 +22,16 @@ export function AddWorktreeModal({
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
-  const addedSet = useMemo(() => new Set(addedPaths), [addedPaths]);
+  // Snapshot exclusions at open — ignore parent polls while modal is open.
+  const [excluded] = useState(() => new Set(addedPaths));
 
   useEffect(() => {
     let cancelled = false;
-    setLoading(true);
-    setError(null);
 
     void invoke<Worktree[]>("list_worktrees", { path: projectPath })
       .then((list) => {
         if (cancelled) return;
-        setAvailable(list.filter((wt) => !addedSet.has(wt.path)));
+        setAvailable(list.filter((wt) => !excluded.has(wt.path)));
       })
       .catch((e) => {
         if (cancelled) return;
@@ -46,11 +45,16 @@ export function AddWorktreeModal({
     return () => {
       cancelled = true;
     };
-  }, [projectPath, addedSet]);
+    // Load once when modal opens for this project.
+  }, [projectPath, excluded]);
 
   useEffect(() => {
-    inputRef.current?.focus();
-  }, []);
+    // Focus after paint; re-run when loading ends (disabled inputs reject focus).
+    const id = window.requestAnimationFrame(() => {
+      inputRef.current?.focus();
+    });
+    return () => window.cancelAnimationFrame(id);
+  }, [loading]);
 
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
@@ -63,11 +67,7 @@ export function AddWorktreeModal({
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
     if (!q) return available;
-    return available.filter(
-      (wt) =>
-        wt.name.toLowerCase().includes(q) ||
-        wt.path.toLowerCase().includes(q),
-    );
+    return available.filter((wt) => wt.name.toLowerCase().includes(q));
   }, [available, query]);
 
   return (
@@ -97,10 +97,15 @@ export function AddWorktreeModal({
             ref={inputRef}
             type="search"
             className="modal-search-input"
-            placeholder="Filter by name or path…"
+            placeholder="Filter by name…"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            disabled={loading}
+            autoComplete="off"
+            autoFocus
+            autoCorrect="off"
+            autoCapitalize="off"
+            spellCheck={false}
+            name="worktree-filter"
           />
         </div>
 
@@ -122,7 +127,6 @@ export function AddWorktreeModal({
                   type="button"
                   className="modal-list-item"
                   onClick={() => onAdd(wt)}
-                  title={wt.path}
                 >
                   <span className="modal-item-name">{wt.name}</span>
                   <span className="modal-item-path">{wt.path}</span>
