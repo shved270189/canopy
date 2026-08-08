@@ -24,6 +24,21 @@ export type Commit = {
   refs: string[];
 };
 
+export type CommitFile = {
+  path: string;
+  status: string;
+};
+
+export type CommitDetails = {
+  message: string;
+  parents: string[];
+  files: CommitFile[];
+};
+
+export type GraphSelection =
+  | { kind: "uncommitted" }
+  | { kind: "commit"; id: string };
+
 export type StatusFile = {
   path: string;
   status: string;
@@ -40,6 +55,7 @@ export type SyncStatus = {
   branch: string | null;
   ahead: number;
   behind: number;
+  hasRemoteBranch: boolean;
   canPush: boolean;
   canPull: boolean;
 };
@@ -47,6 +63,7 @@ export type SyncStatus = {
 export type SelectedFile = {
   path: string;
   staged: boolean;
+  commitId?: string;
 };
 
 export type FilePreview =

@@ -4,7 +4,7 @@ Open-source Git client built for worktrees. Browse repos, switch worktrees, and 
 
 Stack: **Tauri 2** + **React** + **TypeScript**. Tooling via **mise**.
 
-![Canopy app screenshot](docs/screenshot.jpg)
+![Canopy app screenshot](docs/screenshot.png)
 
 ## Prerequisites
 

@@ -347,6 +347,21 @@ pub struct CommitInfo {
 
 #[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
+pub struct CommitFileInfo {
+    pub path: String,
+    pub status: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct CommitDetails {
+    pub message: String,
+    pub parents: Vec<String>,
+    pub files: Vec<CommitFileInfo>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct StatusFile {
     pub path: String,
     pub status: String,
@@ -419,6 +434,87 @@ fn parse_commit_log(out: &str) -> Vec<CommitInfo> {
         });
     }
     commits
+}
+
+fn parse_commit_files(out: &str) -> Vec<CommitFileInfo> {
+    out.lines()
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split('\t').collect();
+            if fields.len() < 2 {
+                return None;
+            }
+            let status = fields[0].chars().next().unwrap_or('?');
+            let path = fields.last()?.trim();
+            if path.is_empty() {
+                return None;
+            }
+            Some(CommitFileInfo {
+                path: parse_status_path(path),
+                status: status_label(status).into(),
+            })
+        })
+        .collect()
+}
+
+fn valid_commit_id(commit: &str) -> Result<String, String> {
+    let id = commit.trim();
+    if (id.len() != 40 && id.len() != 64) || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("invalid commit hash".into());
+    }
+    Ok(id.to_string())
+}
+
+fn first_parent(repo: &Path, commit: &str) -> Result<Option<String>, String> {
+    Ok(git(repo, &["show", "-s", "--format=%P", commit])?
+        .split_whitespace()
+        .next()
+        .map(str::to_string))
+}
+
+#[tauri::command]
+fn commit_details(path: String, commit: String) -> Result<CommitDetails, String> {
+    let repo = PathBuf::from(&path);
+    let commit = valid_commit_id(&commit)?;
+    let metadata = git(
+        &repo,
+        &[
+            "show",
+            "-s",
+            "--date=iso-strict",
+            "--format=%H%x1f%P%x1f%an%x1f%ad%x1f%B",
+            &commit,
+        ],
+    )?;
+    let parts: Vec<&str> = metadata.splitn(5, '\x1f').collect();
+    if parts.len() < 5 {
+        return Err("could not read commit details".into());
+    }
+
+    let parents: Vec<String> = parts[1].split_whitespace().map(str::to_string).collect();
+    let files = match parents.first() {
+        Some(parent) => git(
+            &repo,
+            &["diff", "--find-renames", "--name-status", parent, &commit],
+        )?,
+        None => git(
+            &repo,
+            &[
+                "diff-tree",
+                "--root",
+                "--no-commit-id",
+                "--name-status",
+                "-r",
+                "--find-renames",
+                &commit,
+            ],
+        )?,
+    };
+
+    Ok(CommitDetails {
+        message: parts[4].trim().to_string(),
+        parents,
+        files: parse_commit_files(&files),
+    })
 }
 
 fn status_label(code: char) -> &'static str {
@@ -593,6 +689,7 @@ pub struct SyncStatus {
     pub branch: Option<String>,
     pub ahead: u32,
     pub behind: u32,
+    pub has_remote_branch: bool,
     pub can_push: bool,
     pub can_pull: bool,
 }
@@ -631,6 +728,16 @@ fn parse_ahead_behind(output: &str) -> (u32, u32) {
     (ahead, behind)
 }
 
+fn branch_creation_commit(repo: &Path, branch: &str) -> Option<String> {
+    let reflog = git(repo, &["reflog", "show", "--format=%H%x1f%gs", branch]).ok()?;
+    reflog.lines().rev().find_map(|line| {
+        let (commit, subject) = line.split_once('\x1f')?;
+        subject
+            .starts_with("branch: Created from ")
+            .then(|| commit.to_string())
+    })
+}
+
 #[tauri::command]
 fn remote_sync_status(path: String) -> Result<SyncStatus, String> {
     let repo = PathBuf::from(&path);
@@ -641,6 +748,7 @@ fn remote_sync_status(path: String) -> Result<SyncStatus, String> {
             branch: None,
             ahead: 0,
             behind: 0,
+            has_remote_branch: false,
             can_push: false,
             can_pull: false,
         });
@@ -651,22 +759,27 @@ fn remote_sync_status(path: String) -> Result<SyncStatus, String> {
             branch: Some(branch),
             ahead: 0,
             behind: 0,
+            has_remote_branch: false,
             can_push: false,
             can_pull: false,
         });
     }
 
     if !remote_branch_exists(&repo, &branch) {
-        // New local branch — count commits as ahead (nothing on origin yet).
-        let ahead = git(&repo, &["rev-list", "--count", "HEAD"])
-            .ok()
-            .and_then(|s| s.trim().parse().ok())
+        let ahead = branch_creation_commit(&repo, &branch)
+            .and_then(|base| {
+                let range = format!("{base}..HEAD");
+                git(&repo, &["rev-list", "--count", &range])
+                    .ok()
+                    .and_then(|s| s.trim().parse().ok())
+            })
             .unwrap_or(0);
         return Ok(SyncStatus {
             branch: Some(branch),
             ahead,
             behind: 0,
-            can_push: ahead > 0,
+            has_remote_branch: false,
+            can_push: true,
             can_pull: false,
         });
     }
@@ -683,6 +796,7 @@ fn remote_sync_status(path: String) -> Result<SyncStatus, String> {
         branch: Some(branch),
         ahead,
         behind,
+        has_remote_branch: true,
         can_push: ahead > 0,
         can_pull: behind > 0,
     })
@@ -792,6 +906,24 @@ pub enum FilePreview {
     },
 }
 
+fn commit_text_diff(repo: &Path, file: &str, commit: &str) -> Result<String, String> {
+    if let Some(parent) = first_parent(repo, commit)? {
+        return git_diff(repo, &["diff", "--find-renames", &parent, commit, "--", file]);
+    }
+    git_diff(
+        repo,
+        &[
+            "diff-tree",
+            "--root",
+            "--no-commit-id",
+            "-p",
+            "--find-renames",
+            commit,
+            "--",
+            file,
+        ],
+    )
+}
 
 fn text_diff(repo: &Path, file: &str, staged: bool) -> Result<String, String> {
     if staged {
@@ -808,6 +940,25 @@ fn text_diff(repo: &Path, file: &str, staged: bool) -> Result<String, String> {
     }
 
     git_diff(repo, &["diff", "--", file])
+}
+
+fn is_binary_diff(text: &str) -> bool {
+    text.lines().any(|line| line.starts_with("Binary files "))
+}
+
+fn load_committed_image_bytes(
+    repo: &Path,
+    file: &str,
+    commit: &str,
+) -> Result<(Vec<u8>, String), String> {
+    let rev_path = format!("{commit}:{file}");
+    let bytes = git_blob_bytes(repo, &rev_path).or_else(|_| {
+        let parent_ref = format!("{commit}^");
+        let parent = git(repo, &["rev-parse", &parent_ref])?;
+        let parent_path = format!("{}:{file}", parent.trim());
+        git_blob_bytes(repo, &parent_path)
+    })?;
+    Ok((bytes, "committed".into()))
 }
 
 fn load_image_bytes(repo: &Path, file: &str, staged: bool) -> Result<(Vec<u8>, String), String> {
@@ -863,8 +1014,30 @@ fn file_preview(path: String, file: String, staged: bool) -> Result<FilePreview,
     repo_relative_file(&file)?;
     let repo = PathBuf::from(&path);
 
-    if let Some(mime) = image_mime(&file) {
-        match load_image_bytes(&repo, &file, staged) {
+    file_preview_for(&repo, &file, staged, None)
+}
+
+#[tauri::command]
+fn commit_file_preview(path: String, file: String, commit: String) -> Result<FilePreview, String> {
+    repo_relative_file(&file)?;
+    let repo = PathBuf::from(&path);
+    let commit = valid_commit_id(&commit)?;
+
+    file_preview_for(&repo, &file, false, Some(&commit))
+}
+
+fn file_preview_for(
+    repo: &Path,
+    file: &str,
+    staged: bool,
+    commit: Option<&str>,
+) -> Result<FilePreview, String> {
+    if let Some(mime) = image_mime(file) {
+        let image = match commit {
+            Some(commit) => load_committed_image_bytes(repo, file, commit),
+            None => load_image_bytes(repo, file, staged),
+        };
+        match image {
             Ok((bytes, label)) => {
                 if bytes.is_empty() {
                     return Ok(FilePreview::Binary {
@@ -895,9 +1068,12 @@ fn file_preview(path: String, file: String, staged: bool) -> Result<FilePreview,
         }
     }
 
-    let text = text_diff(&repo, &file, staged)?;
+    let text = match commit {
+        Some(commit) => commit_text_diff(repo, file, commit)?,
+        None => text_diff(repo, file, staged)?,
+    };
     let trimmed = text.trim();
-    if trimmed.starts_with("Binary files") || trimmed.contains("Binary files ") {
+    if is_binary_diff(&text) {
         return Ok(FilePreview::Binary {
             message: if trimmed.is_empty() {
                 "Binary file".into()
@@ -950,6 +1126,7 @@ pub fn run() {
             list_worktrees_with_status,
             remove_worktree,
             list_commits,
+            commit_details,
             worktree_status,
             stage_file,
             unstage_file,
@@ -960,6 +1137,7 @@ pub fn run() {
             push_origin,
             pull_origin,
             file_preview,
+            commit_file_preview,
             load_projects,
             save_projects,
             load_panel_layouts,
@@ -1046,6 +1224,20 @@ detached
         assert_eq!(parse_ahead_behind("0 3"), (0, 3));
         assert_eq!(parse_ahead_behind(""), (0, 0));
         assert_eq!(parse_ahead_behind("nope"), (0, 0));
+    }
+
+    #[test]
+    fn branch_creation_commit_reads_created_from_reflog() {
+        let dir = temp_dir("branch-creation");
+        git(&dir, &["init", "-q"]).unwrap();
+        git(&dir, &["config", "user.email", "test@example.com"]).unwrap();
+        git(&dir, &["config", "user.name", "Test"]).unwrap();
+        git(&dir, &["commit", "--allow-empty", "-qm", "base"]).unwrap();
+        let base = git(&dir, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+        git(&dir, &["switch", "-c", "feature"]).unwrap();
+
+        assert_eq!(branch_creation_commit(&dir, "feature"), Some(base));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1166,12 +1358,39 @@ R  old.rs -> renamed.rs
     }
 
     #[test]
+    fn parse_commit_files_maps_status_and_rename_paths() {
+        let files = parse_commit_files("M\tchanged.rs\nA\tnew.rs\nR100\told.rs\tnew-name.rs\n");
+        assert_eq!(files.len(), 3);
+        assert_eq!(files[0].path, "changed.rs");
+        assert_eq!(files[0].status, "modified");
+        assert_eq!(files[1].status, "added");
+        assert_eq!(files[2].path, "new-name.rs");
+        assert_eq!(files[2].status, "renamed");
+    }
+
+    #[test]
+    fn valid_commit_id_accepts_hash_lengths_only() {
+        assert!(valid_commit_id(&"a".repeat(40)).is_ok());
+        assert!(valid_commit_id(&"a".repeat(64)).is_ok());
+        assert!(valid_commit_id("not-a-commit").is_err());
+        assert!(valid_commit_id(&"a".repeat(39)).is_err());
+    }
+
+    #[test]
     fn image_mime_by_extension() {
         assert_eq!(image_mime("a.PNG"), Some("image/png"));
         assert_eq!(image_mime("x/y.jpeg"), Some("image/jpeg"));
         assert_eq!(image_mime("icon.svg"), Some("image/svg+xml"));
         assert_eq!(image_mime("readme.md"), None);
         assert_eq!(image_mime("noext"), None);
+    }
+
+    #[test]
+    fn binary_diff_detection_ignores_source_text() {
+        assert!(!is_binary_diff(
+            "diff --git a/lib.rs b/lib.rs\n+if text.contains(\"Binary files \") {}\n"
+        ));
+        assert!(is_binary_diff("Binary files a/image.png and b/image.png differ\n"));
     }
 
     #[test]

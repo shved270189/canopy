@@ -1,12 +1,14 @@
-import type { Commit } from "../types";
+import type { Commit, GraphSelection } from "../types";
 
 type CommitGraphProps = {
   commits: Commit[];
   hasChanges: boolean;
   loading: boolean;
+  selected: GraphSelection | null;
+  onSelect: (selection: GraphSelection) => void;
 };
 
-function formatDate(iso: string): string {
+export function formatDate(iso: string): string {
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return iso;
   const now = new Date();
@@ -31,7 +33,13 @@ function refClass(ref: string): string {
   return "ref-local";
 }
 
-export function CommitGraph({ commits, hasChanges, loading }: CommitGraphProps) {
+export function CommitGraph({
+  commits,
+  hasChanges,
+  loading,
+  selected,
+  onSelect,
+}: CommitGraphProps) {
   return (
     <section className="graph-pane">
       <header className="pane-header graph-header">
@@ -52,47 +60,61 @@ export function CommitGraph({ commits, hasChanges, loading }: CommitGraphProps) 
 
         <ul className="graph-list">
           {hasChanges && (
-            <li className="graph-row uncommitted">
-              <div className="graph-lane">
-                <span className="graph-dot open" />
-                <span className="graph-line" />
-              </div>
-              <div className="graph-body">
-                <span className="graph-subject">Uncommitted changes</span>
-              </div>
-              <span className="graph-hash">*</span>
-              <span className="graph-author">*</span>
-              <span className="graph-date">{formatDate(new Date().toISOString())}</span>
+            <li>
+              <button
+                type="button"
+                className={`graph-row uncommitted${selected?.kind === "uncommitted" ? " selected" : ""}`}
+                aria-pressed={selected?.kind === "uncommitted"}
+                onClick={() => onSelect({ kind: "uncommitted" })}
+              >
+                <div className="graph-lane">
+                  <span className="graph-dot open" />
+                  <span className="graph-line" />
+                </div>
+                <div className="graph-body">
+                  <span className="graph-subject">Uncommitted changes</span>
+                </div>
+                <span className="graph-hash">*</span>
+                <span className="graph-author">*</span>
+                <span className="graph-date">{formatDate(new Date().toISOString())}</span>
+              </button>
             </li>
           )}
 
           {commits.map((commit, index) => (
-            <li key={commit.id} className="graph-row">
-              <div className="graph-lane">
-                <span className="graph-dot" />
-                {index < commits.length - 1 && <span className="graph-line" />}
-              </div>
-              <div className="graph-body">
-                {commit.refs.length > 0 && (
-                  <span className="graph-refs">
-                    {commit.refs.map((ref) => (
-                      <span key={ref} className={`graph-ref ${refClass(ref)}`}>
-                        {ref}
-                      </span>
-                    ))}
+            <li key={commit.id}>
+              <button
+                type="button"
+                className={`graph-row${selected?.kind === "commit" && selected.id === commit.id ? " selected" : ""}`}
+                aria-pressed={selected?.kind === "commit" && selected.id === commit.id}
+                onClick={() => onSelect({ kind: "commit", id: commit.id })}
+              >
+                <div className="graph-lane">
+                  <span className="graph-dot" />
+                  {index < commits.length - 1 && <span className="graph-line" />}
+                </div>
+                <div className="graph-body">
+                  {commit.refs.length > 0 && (
+                    <span className="graph-refs">
+                      {commit.refs.map((ref) => (
+                        <span key={ref} className={`graph-ref ${refClass(ref)}`}>
+                          {ref}
+                        </span>
+                      ))}
+                    </span>
+                  )}
+                  <span className="graph-subject" title={commit.subject}>
+                    {commit.subject}
                   </span>
-                )}
-                <span className="graph-subject" title={commit.subject}>
-                  {commit.subject}
+                </div>
+                <span className="graph-hash" title={commit.id}>
+                  {commit.shortId}
                 </span>
-              </div>
-              <span className="graph-hash" title={commit.id}>
-                {commit.shortId}
-              </span>
-              <span className="graph-author" title={commit.author}>
-                {commit.author}
-              </span>
-              <span className="graph-date">{formatDate(commit.date)}</span>
+                <span className="graph-author" title={commit.author}>
+                  {commit.author}
+                </span>
+                <span className="graph-date">{formatDate(commit.date)}</span>
+              </button>
             </li>
           ))}
         </ul>
