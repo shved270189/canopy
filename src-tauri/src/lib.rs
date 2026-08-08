@@ -385,6 +385,10 @@ fn list_commits(path: String, limit: Option<u32>) -> Result<Vec<CommitInfo>, Str
         });
     }
 
+    Ok(parse_commit_log(&out))
+}
+
+fn parse_commit_log(out: &str) -> Vec<CommitInfo> {
     let mut commits = Vec::new();
     for line in out.lines() {
         if line.is_empty() {
@@ -414,7 +418,7 @@ fn list_commits(path: String, limit: Option<u32>) -> Result<Vec<CommitInfo>, Str
             refs,
         });
     }
-    Ok(commits)
+    commits
 }
 
 fn status_label(code: char) -> &'static str {
@@ -434,21 +438,13 @@ fn status_label(code: char) -> &'static str {
 
 fn parse_status_path(rest: &str) -> String {
     let rest = rest.trim();
-    if let Some((orig, new_path)) = rest.split_once(" -> ") {
-        let _ = orig;
+    if let Some((_orig, new_path)) = rest.split_once(" -> ") {
         return new_path.trim().trim_matches('"').to_string();
     }
     rest.trim_matches('"').to_string()
 }
 
-#[tauri::command]
-fn worktree_status(path: String) -> Result<WorktreeStatus, String> {
-    let repo = PathBuf::from(&path);
-    let out = git(
-        &repo,
-        &["status", "--porcelain=v1", "--untracked-files=all"],
-    )?;
-
+fn parse_status_porcelain(out: &str) -> WorktreeStatus {
     let mut staged = Vec::new();
     let mut unstaged = Vec::new();
 
@@ -497,11 +493,21 @@ fn worktree_status(path: String) -> Result<WorktreeStatus, String> {
     }
 
     let has_changes = !staged.is_empty() || !unstaged.is_empty();
-    Ok(WorktreeStatus {
+    WorktreeStatus {
         staged,
         unstaged,
         has_changes,
-    })
+    }
+}
+
+#[tauri::command]
+fn worktree_status(path: String) -> Result<WorktreeStatus, String> {
+    let repo = PathBuf::from(&path);
+    let out = git(
+        &repo,
+        &["status", "--porcelain=v1", "--untracked-files=all"],
+    )?;
+    Ok(parse_status_porcelain(&out))
 }
 
 fn git_paths(repo: &Path, subcommand: &[&str], files: &[String]) -> Result<(), String> {
@@ -967,6 +973,17 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_dir(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("canopy-test-{label}-{nanos}"));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
 
     #[test]
     fn parse_porcelain_worktrees() {
@@ -987,9 +1004,18 @@ detached
         assert_eq!(list.len(), 3);
         assert_eq!(list[0].name, "main");
         assert_eq!(list[0].path, "/tmp/repo");
+        assert_eq!(list[0].branch.as_deref(), Some("main"));
+        assert_eq!(list[0].head.as_deref(), Some("abcdef0123456789"));
         assert_eq!(list[1].name, "feature/foo");
         assert_eq!(list[2].name, "repo-detached");
         assert_eq!(list[2].branch, None);
+        assert!(!list[0].has_changes);
+        assert!(!list[0].has_stash);
+    }
+
+    #[test]
+    fn parse_porcelain_worktrees_empty() {
+        assert!(parse_worktrees("").is_empty());
     }
 
     #[test]
@@ -1003,6 +1029,7 @@ detached
             Some("feature/foo".into())
         );
         assert_eq!(parse_stash_branch("stash@{2}: autostash"), None);
+        assert_eq!(parse_stash_branch("not a stash line"), None);
     }
 
     #[test]
@@ -1018,16 +1045,192 @@ detached
         assert_eq!(parse_ahead_behind("2\t1\n"), (2, 1));
         assert_eq!(parse_ahead_behind("0 3"), (0, 3));
         assert_eq!(parse_ahead_behind(""), (0, 0));
+        assert_eq!(parse_ahead_behind("nope"), (0, 0));
     }
 
     #[test]
-    fn repo_relative_file_rejects_escape() {
-        assert!(repo_relative_file("src/main.rs").is_ok());
+    fn repo_relative_file_accepts_and_rejects() {
+        assert_eq!(repo_relative_file("src/main.rs").unwrap(), "src/main.rs");
+        assert_eq!(repo_relative_file("./foo").unwrap(), "./foo");
+        assert_eq!(repo_relative_file("a/b/c.txt").unwrap(), "a/b/c.txt");
         assert!(repo_relative_file("../secret").is_err());
+        assert!(repo_relative_file("a/../b").is_err());
         assert!(repo_relative_file("/etc/passwd").is_err());
         assert!(repo_relative_file("").is_err());
     }
+
+    #[test]
+    fn short_branch_strips_refs_heads() {
+        assert_eq!(short_branch("refs/heads/main"), "main");
+        assert_eq!(short_branch("refs/heads/feature/x"), "feature/x");
+        assert_eq!(short_branch("main"), "main");
+    }
+
+    #[test]
+    fn path_name_uses_last_segment() {
+        assert_eq!(path_name("/tmp/repo-feature"), "repo-feature");
+        assert_eq!(path_name("simple"), "simple");
+    }
+
+    #[test]
+    fn status_label_maps_codes() {
+        assert_eq!(status_label('M'), "modified");
+        assert_eq!(status_label('A'), "added");
+        assert_eq!(status_label('D'), "deleted");
+        assert_eq!(status_label('R'), "renamed");
+        assert_eq!(status_label('?'), "untracked");
+        assert_eq!(status_label('X'), "changed");
+    }
+
+    #[test]
+    fn parse_status_path_handles_rename_and_quotes() {
+        assert_eq!(parse_status_path("src/a.rs"), "src/a.rs");
+        assert_eq!(parse_status_path("\"path with space.rs\""), "path with space.rs");
+        assert_eq!(
+            parse_status_path("old.rs -> new.rs"),
+            "new.rs"
+        );
+        assert_eq!(
+            parse_status_path("\"old name.rs\" -> \"new name.rs\""),
+            "new name.rs"
+        );
+    }
+
+    #[test]
+    fn parse_status_porcelain_splits_staged_unstaged() {
+        let out = "\
+M  staged.rs
+ M unstaged.rs
+MM both.rs
+A  added.rs
+?? untracked.rs
+R  old.rs -> renamed.rs
+";
+        let status = parse_status_porcelain(out);
+        assert!(status.has_changes);
+
+        let staged_paths: Vec<_> = status.staged.iter().map(|f| f.path.as_str()).collect();
+        assert!(staged_paths.contains(&"staged.rs"));
+        assert!(staged_paths.contains(&"both.rs"));
+        assert!(staged_paths.contains(&"added.rs"));
+        assert!(staged_paths.contains(&"renamed.rs"));
+        assert!(!staged_paths.contains(&"unstaged.rs"));
+        assert!(!staged_paths.contains(&"untracked.rs"));
+
+        let unstaged_paths: Vec<_> = status.unstaged.iter().map(|f| f.path.as_str()).collect();
+        assert!(unstaged_paths.contains(&"unstaged.rs"));
+        assert!(unstaged_paths.contains(&"both.rs"));
+        assert!(unstaged_paths.contains(&"untracked.rs"));
+
+        let untracked = status
+            .unstaged
+            .iter()
+            .find(|f| f.path == "untracked.rs")
+            .unwrap();
+        assert_eq!(untracked.status, "untracked");
+        assert!(!untracked.staged);
+    }
+
+    #[test]
+    fn parse_status_porcelain_empty() {
+        let status = parse_status_porcelain("");
+        assert!(!status.has_changes);
+        assert!(status.staged.is_empty());
+        assert!(status.unstaged.is_empty());
+    }
+
+    #[test]
+    fn parse_commit_log_fields_and_refs() {
+        let out = format!(
+            "{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}",
+            "aabbccddeeff00112233445566778899aabbccdd",
+            "aabbccd",
+            "Ada",
+            "2026-01-02T03:04:05+00:00",
+            "Ship it",
+            "HEAD -> main, origin/main, tag: v1.0"
+        );
+        let commits = parse_commit_log(&out);
+        assert_eq!(commits.len(), 1);
+        let c = &commits[0];
+        assert_eq!(c.short_id, "aabbccd");
+        assert_eq!(c.author, "Ada");
+        assert_eq!(c.subject, "Ship it");
+        assert_eq!(c.refs, vec!["main", "origin/main", "v1.0"]);
+    }
+
+    #[test]
+    fn parse_commit_log_skips_short_lines() {
+        assert!(parse_commit_log("too\x1fshort").is_empty());
+        assert!(parse_commit_log("").is_empty());
+    }
+
+    #[test]
+    fn image_mime_by_extension() {
+        assert_eq!(image_mime("a.PNG"), Some("image/png"));
+        assert_eq!(image_mime("x/y.jpeg"), Some("image/jpeg"));
+        assert_eq!(image_mime("icon.svg"), Some("image/svg+xml"));
+        assert_eq!(image_mime("readme.md"), None);
+        assert_eq!(image_mime("noext"), None);
+    }
+
+    #[test]
+    fn encode_base64_padding() {
+        assert_eq!(encode_base64(b""), "");
+        assert_eq!(encode_base64(b"f"), "Zg==");
+        assert_eq!(encode_base64(b"fo"), "Zm8=");
+        assert_eq!(encode_base64(b"foo"), "Zm9v");
+        assert_eq!(encode_base64(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn write_atomic_roundtrip() {
+        let dir = temp_dir("atomic");
+        let path = dir.join("data.json");
+        write_atomic(&path, "{\"ok\":true}").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "{\"ok\":true}");
+        // overwrite
+        write_atomic(&path, "{\"ok\":false}").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "{\"ok\":false}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_write_json_file_roundtrip() {
+        let dir = temp_dir("json");
+        let path = dir.join("projects.json");
+
+        let missing: Vec<ProjectInfo> = read_json_file(&path).unwrap();
+        assert!(missing.is_empty());
+
+        let projects = vec![ProjectInfo {
+            path: "/tmp/repo".into(),
+            name: "repo".into(),
+            worktrees: vec!["/tmp/wt".into()],
+        }];
+        write_json_file(&path, &projects).unwrap();
+
+        let loaded: Vec<ProjectInfo> = read_json_file(&path).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].name, "repo");
+        assert_eq!(loaded[0].worktrees, vec!["/tmp/wt".to_string()]);
+
+        // empty file → default
+        fs::write(&path, "   ").unwrap();
+        let empty: Vec<ProjectInfo> = read_json_file(&path).unwrap();
+        assert!(empty.is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn same_path_matches_identical_and_canonical() {
+        let dir = temp_dir("same-path");
+        let a = dir.join("file.txt");
+        fs::write(&a, "x").unwrap();
+        assert!(same_path(&a, &a));
+        assert!(same_path(&dir, &dir));
+        assert!(!same_path(&a, &dir.join("missing.txt")));
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
-
-
-
