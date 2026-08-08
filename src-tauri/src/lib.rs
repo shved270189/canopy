@@ -952,13 +952,27 @@ fn load_committed_image_bytes(
     commit: &str,
 ) -> Result<(Vec<u8>, String), String> {
     let rev_path = format!("{commit}:{file}");
-    let bytes = git_blob_bytes(repo, &rev_path).or_else(|_| {
-        let parent_ref = format!("{commit}^");
-        let parent = git(repo, &["rev-parse", &parent_ref])?;
-        let parent_path = format!("{}:{file}", parent.trim());
-        git_blob_bytes(repo, &parent_path)
-    })?;
-    Ok((bytes, "committed".into()))
+    match git_blob_bytes(repo, &rev_path) {
+        Ok(bytes) => Ok((bytes, "committed".into())),
+        Err(error) => {
+            let path_exists = match git(
+                repo,
+                &["ls-tree", "-r", "--name-only", commit, "--", file],
+            ) {
+                Ok(paths) => !paths.trim().is_empty(),
+                Err(_) => return Err(error),
+            };
+            if path_exists {
+                return Err(error);
+            }
+
+            let parent_ref = format!("{commit}^");
+            let parent = git(repo, &["rev-parse", &parent_ref])?;
+            let parent_path = format!("{}:{file}", parent.trim());
+            let bytes = git_blob_bytes(repo, &parent_path)?;
+            Ok((bytes, "deleted (was)".into()))
+        }
+    }
 }
 
 fn load_image_bytes(repo: &Path, file: &str, staged: bool) -> Result<(Vec<u8>, String), String> {
@@ -1383,6 +1397,43 @@ R  old.rs -> renamed.rs
         assert_eq!(image_mime("icon.svg"), Some("image/svg+xml"));
         assert_eq!(image_mime("readme.md"), None);
         assert_eq!(image_mime("noext"), None);
+    }
+
+    #[test]
+    fn committed_image_label_matches_source_commit() {
+        let dir = temp_dir("committed-image-label");
+        git(&dir, &["init", "-q"]).unwrap();
+        git(&dir, &["config", "user.email", "test@example.com"]).unwrap();
+        git(&dir, &["config", "user.name", "Test"]).unwrap();
+
+        let image = dir.join("deleted.png");
+        fs::write(&image, b"old").unwrap();
+        git(&dir, &["add", "deleted.png"]).unwrap();
+        git(&dir, &["commit", "-qm", "add image"]).unwrap();
+        let source_commit = git(&dir, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+
+        fs::remove_file(&image).unwrap();
+        git(&dir, &["add", "-u"]).unwrap();
+        git(&dir, &["commit", "-qm", "delete image"]).unwrap();
+        let deleted_commit = git(&dir, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+
+        let (bytes, label) =
+            load_committed_image_bytes(&dir, "deleted.png", &source_commit).unwrap();
+        assert_eq!(bytes, b"old");
+        assert_eq!(label, "committed");
+
+        let (bytes, label) =
+            load_committed_image_bytes(&dir, "deleted.png", &deleted_commit).unwrap();
+        assert_eq!(bytes, b"old");
+        assert_eq!(label, "deleted (was)");
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

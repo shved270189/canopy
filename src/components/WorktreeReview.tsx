@@ -52,7 +52,18 @@ type FileMenuState = {
 };
 
 function fullFilePath(worktreePath: string, filePath: string): string {
-  return `${worktreePath.replace(/\/+$/, "")}/${filePath}`;
+  const separator = worktreePath.includes("\\") ? "\\" : "/";
+  const relativeFilePath = filePath
+    .replace(/^[/\\]+/, "")
+    .replace(/[\\/]+/g, separator);
+  return `${worktreePath.replace(/[\\/]+$/, "")}${separator}${relativeFilePath}`;
+}
+
+async function copyPath(path: string): Promise<void> {
+  if (!navigator.clipboard) return;
+  try {
+    await navigator.clipboard.writeText(path);
+  } catch {}
 }
 
 function statusEqual(a: WorktreeStatus, b: WorktreeStatus): boolean {
@@ -160,7 +171,7 @@ function CommitDetailsSection({
               <dd><code>{commit.id}</code></dd>
             </div>
             <div className="commit-detail-row">
-              <dt>Parents hashes</dt>
+              <dt>Parent hashes</dt>
               <dd>
                 {details.parents.length > 0
                   ? details.parents.map((parent) => <code key={parent}>{parent}</code>)
@@ -774,15 +785,12 @@ export function WorktreeReview({ worktreePath, panelStorage }: WorktreeReviewPro
             {
               id: "copy-path",
               label: "Copy path",
-              onClick: () => void navigator.clipboard?.writeText(fileMenu.path),
+              onClick: () => void copyPath(fileMenu.path),
             },
             {
               id: "copy-full-path",
               label: "Copy full path",
-              onClick: () =>
-                void navigator.clipboard?.writeText(
-                  fullFilePath(worktreePath, fileMenu.path),
-                ),
+              onClick: () => void copyPath(fullFilePath(worktreePath, fileMenu.path)),
             },
           ] satisfies ContextMenuItem[]}
           onClose={() => setFileMenu(null)}
