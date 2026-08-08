@@ -1,4 +1,5 @@
-import { useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
+import { Check, Copy } from "lucide-react";
 import type { FilePreview, SelectedFile } from "../types";
 import { highlightCode, languageForPath } from "../syntax";
 
@@ -56,7 +57,30 @@ function classifyLine(text: string): DiffLine {
 }
 
 export function DiffView({ file, preview, loading, error }: DiffViewProps) {
+  const [copiedFile, setCopiedFile] = useState<SelectedFile | null>(null);
   const language = file ? languageForPath(file.path) : null;
+  const isCopied =
+    !!file &&
+    !!copiedFile &&
+    copiedFile.path === file.path &&
+    copiedFile.staged === file.staged &&
+    copiedFile.commitId === file.commitId;
+
+  useEffect(() => {
+    if (!copiedFile) return;
+    const timeout = window.setTimeout(() => setCopiedFile(null), 1000);
+    return () => window.clearTimeout(timeout);
+  }, [copiedFile]);
+
+  async function handleCopyPath() {
+    if (!file || !navigator.clipboard) return;
+    try {
+      await navigator.clipboard.writeText(file.path);
+      setCopiedFile(file);
+    } catch {
+      setCopiedFile(null);
+    }
+  }
 
   const lines = useMemo(() => {
     if (preview?.kind !== "text") return [];
@@ -68,11 +92,26 @@ export function DiffView({ file, preview, loading, error }: DiffViewProps) {
       <header className="pane-header diff-header">
         {file ? (
           <>
-            <span className="diff-file-path" title={file.path}>
-              {file.path}
-            </span>
+            <div className="diff-file-info">
+              <span className="diff-file-path" title={file.path}>
+                {file.path}
+              </span>
+              <button
+                type="button"
+                className={`diff-copy-path${isCopied ? " copied" : ""}`}
+                title={isCopied ? "Copied" : "Copy path"}
+                aria-label={isCopied ? "Copied" : "Copy path"}
+                onClick={() => void handleCopyPath()}
+              >
+                {isCopied ? (
+                  <Check size={14} strokeWidth={4} aria-hidden />
+                ) : (
+                  <Copy size={14} strokeWidth={1.75} aria-hidden />
+                )}
+              </button>
+            </div>
             <span className="diff-file-kind">
-              {file.staged ? "staged" : "unstaged"}
+              {file.commitId ? "committed" : file.staged ? "staged" : "unstaged"}
               {preview?.kind === "image" ? ` · ${preview.label}` : ""}
               {language ? ` · ${language}` : ""}
               {preview?.kind === "text" ? ` · ${preview.lines.length} lines` : ""}

@@ -200,8 +200,13 @@ export function highlightCode(code: string, language: string | null): string {
     return escapeHtml(code);
   }
 
-  // Dedicated reliable highlighter for Rust (works on partial diff lines).
   if (language === "rust") {
+    try {
+      const html = hljs.highlight(code, { language, ignoreIllegals: true }).value;
+      if (html.includes("hljs-")) return html;
+    } catch {
+      return highlightRustFallback(code);
+    }
     return highlightRustFallback(code);
   }
 

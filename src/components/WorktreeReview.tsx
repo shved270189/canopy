@@ -9,16 +9,19 @@ import {
 import { ArrowDownToLine, ArrowUpFromLine, GitCommitHorizontal } from "lucide-react";
 import type {
   Commit,
+  CommitDetails,
   FilePreview,
+  GraphSelection,
   SelectedFile,
   StatusFile,
   SyncStatus,
   WorktreeStatus,
 } from "../types";
 
-import { CommitGraph } from "./CommitGraph";
+import { CommitGraph, formatDate } from "./CommitGraph";
+import { ContextMenu, type ContextMenuItem } from "./ContextMenu";
 import { DiffView } from "./DiffView";
-import { StatusFileSection } from "./StatusFiles";
+import { CommitFileSection, StatusFileSection } from "./StatusFiles";
 
 const REFRESH_MS = 10000;
 
@@ -32,6 +35,7 @@ const EMPTY_SYNC: SyncStatus = {
   branch: null,
   ahead: 0,
   behind: 0,
+  hasRemoteBranch: false,
   canPush: false,
   canPull: false,
 };
@@ -40,6 +44,16 @@ type WorktreeReviewProps = {
   worktreePath: string;
   panelStorage: PanelGroupStorage;
 };
+
+type FileMenuState = {
+  x: number;
+  y: number;
+  path: string;
+};
+
+function fullFilePath(worktreePath: string, filePath: string): string {
+  return `${worktreePath.replace(/\/+$/, "")}/${filePath}`;
+}
 
 function statusEqual(a: WorktreeStatus, b: WorktreeStatus): boolean {
   if (a.hasChanges !== b.hasChanges) return false;
@@ -73,14 +87,20 @@ function syncEqual(a: SyncStatus, b: SyncStatus): boolean {
     a.branch === b.branch &&
     a.ahead === b.ahead &&
     a.behind === b.behind &&
+    a.hasRemoteBranch === b.hasRemoteBranch &&
     a.canPush === b.canPush &&
     a.canPull === b.canPull
   );
 }
 
 function fileStillPresent(file: SelectedFile, status: WorktreeStatus): boolean {
+  if (file.commitId) return true;
   const list = file.staged ? status.staged : status.unstaged;
   return list.some((f) => f.path === file.path);
+}
+
+function sameSelectedFile(a: SelectedFile | null, b: SelectedFile): boolean {
+  return !!a && a.path === b.path && a.staged === b.staged && a.commitId === b.commitId;
 }
 
 /** After stage/unstage, keep focus on a sensible neighbor in the source list. */
@@ -112,17 +132,71 @@ function pickAfterToggleAll(fromStaged: boolean, next: WorktreeStatus): Selected
   return null;
 }
 
+function CommitDetailsSection({
+  commit,
+  details,
+  loading,
+  error,
+}: {
+  commit: Commit;
+  details: CommitDetails | null;
+  loading: boolean;
+  error: string | null;
+}) {
+  return (
+    <section className="commit-details-section">
+      <header className="pane-header">Commit details</header>
+      <div className="commit-details-scroll">
+        {loading && <p className="pane-empty">Loading commit details…</p>}
+        {!loading && error && <p className="pane-error">{error}</p>}
+        {!loading && !error && details && (
+          <dl className="commit-details-list">
+            <div className="commit-detail-row">
+              <dt>Message</dt>
+              <dd className="commit-message">{details.message || commit.subject}</dd>
+            </div>
+            <div className="commit-detail-row">
+              <dt>Commit hash</dt>
+              <dd><code>{commit.id}</code></dd>
+            </div>
+            <div className="commit-detail-row">
+              <dt>Parents hashes</dt>
+              <dd>
+                {details.parents.length > 0
+                  ? details.parents.map((parent) => <code key={parent}>{parent}</code>)
+                  : "None"}
+              </dd>
+            </div>
+            <div className="commit-detail-row">
+              <dt>Author</dt>
+              <dd>{commit.author}</dd>
+            </div>
+            <div className="commit-detail-row">
+              <dt>Date</dt>
+              <dd>{formatDate(commit.date)}</dd>
+            </div>
+          </dl>
+        )}
+      </div>
+    </section>
+  );
+}
+
 export function WorktreeReview({ worktreePath, panelStorage }: WorktreeReviewProps) {
   const [commits, setCommits] = useState<Commit[]>([]);
   const [status, setStatus] = useState<WorktreeStatus>(EMPTY_STATUS);
   const [sync, setSync] = useState<SyncStatus>(EMPTY_SYNC);
+  const [selectedGraphLine, setSelectedGraphLine] = useState<GraphSelection | null>(null);
+  const [commitDetails, setCommitDetails] = useState<CommitDetails | null>(null);
   const [selectedFile, setSelectedFile] = useState<SelectedFile | null>(null);
   const [preview, setPreview] = useState<FilePreview | null>(null);
   const [loadingGraph, setLoadingGraph] = useState(true);
   const [loadingStatus, setLoadingStatus] = useState(true);
+  const [loadingCommitDetails, setLoadingCommitDetails] = useState(false);
   const [loadingDiff, setLoadingDiff] = useState(false);
   const [busyStage, setBusyStage] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [commitDetailsError, setCommitDetailsError] = useState<string | null>(null);
   const [diffError, setDiffError] = useState<string | null>(null);
   const [commitOpen, setCommitOpen] = useState(false);
   const [commitMessage, setCommitMessage] = useState("");
@@ -131,11 +205,21 @@ export function WorktreeReview({ worktreePath, panelStorage }: WorktreeReviewPro
   const [pushBusy, setPushBusy] = useState(false);
   const [pullBusy, setPullBusy] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [fileMenu, setFileMenu] = useState<FileMenuState | null>(null);
 
   const pathRef = useRef(worktreePath);
+  const selectedGraphLineRef = useRef(selectedGraphLine);
   const selectedRef = useRef(selectedFile);
+  const diffRequestRef = useRef(0);
   pathRef.current = worktreePath;
+  selectedGraphLineRef.current = selectedGraphLine;
   selectedRef.current = selectedFile;
+
+  const selectedCommitId =
+    selectedGraphLine?.kind === "commit" ? selectedGraphLine.id : null;
+  const selectedCommit = selectedCommitId
+    ? commits.find((commit) => commit.id === selectedCommitId) ?? null
+    : null;
 
   const refreshSync = useCallback(async () => {
     const forPath = worktreePath;
@@ -202,36 +286,85 @@ export function WorktreeReview({ worktreePath, panelStorage }: WorktreeReviewPro
     [worktreePath],
   );
 
+  const loadCommitDetails = useCallback(
+    async (commitId: string) => {
+      const forPath = worktreePath;
+      setLoadingCommitDetails(true);
+      setCommitDetailsError(null);
+      try {
+        const next = await invoke<CommitDetails>("commit_details", {
+          path: forPath,
+          commit: commitId,
+        });
+        if (pathRef.current !== forPath) return;
+        const line = selectedGraphLineRef.current;
+        if (!line || line.kind !== "commit" || line.id !== commitId) return;
+        setCommitDetails(next);
+        setSelectedFile(
+          next.files[0]
+            ? { path: next.files[0].path, staged: false, commitId }
+            : null,
+        );
+      } catch (e) {
+        if (pathRef.current !== forPath) return;
+        const line = selectedGraphLineRef.current;
+        if (!line || line.kind !== "commit" || line.id !== commitId) return;
+        setCommitDetails(null);
+        setCommitDetailsError(String(e));
+      } finally {
+        if (pathRef.current !== forPath) return;
+        const line = selectedGraphLineRef.current;
+        if (line?.kind === "commit" && line.id === commitId) {
+          setLoadingCommitDetails(false);
+        }
+      }
+    },
+    [worktreePath],
+  );
+
   const loadDiff = useCallback(
     async (file: SelectedFile) => {
       const forPath = worktreePath;
       const forFile = file;
+      const requestId = ++diffRequestRef.current;
       setLoadingDiff(true);
       setDiffError(null);
       try {
-        const next = await invoke<FilePreview>("file_preview", {
-          path: forPath,
-          file: forFile.path,
-          staged: forFile.staged,
-        });
+        const next = forFile.commitId
+          ? await invoke<FilePreview>("commit_file_preview", {
+              path: forPath,
+              file: forFile.path,
+              commit: forFile.commitId,
+            })
+          : await invoke<FilePreview>("file_preview", {
+              path: forPath,
+              file: forFile.path,
+              staged: forFile.staged,
+            });
         if (pathRef.current !== forPath) return;
         const sel = selectedRef.current;
-        if (!sel || sel.path !== forFile.path || sel.staged !== forFile.staged) return;
+        if (!sameSelectedFile(sel, forFile)) return;
         setPreview(next);
       } catch (e) {
         if (pathRef.current !== forPath) return;
         const sel = selectedRef.current;
-        if (!sel || sel.path !== forFile.path || sel.staged !== forFile.staged) return;
+        if (!sameSelectedFile(sel, forFile)) return;
         setPreview(null);
         setDiffError(String(e));
       } finally {
-        if (pathRef.current === forPath) setLoadingDiff(false);
+        if (pathRef.current === forPath && diffRequestRef.current === requestId) {
+          setLoadingDiff(false);
+        }
       }
     },
     [worktreePath],
   );
 
   useEffect(() => {
+    setSelectedGraphLine(null);
+    setCommitDetails(null);
+    setCommitDetailsError(null);
+    setLoadingCommitDetails(false);
     setSelectedFile(null);
     setPreview(null);
     setDiffError(null);
@@ -239,6 +372,7 @@ export function WorktreeReview({ worktreePath, panelStorage }: WorktreeReviewPro
     setCommitMessage("");
     setCommitError(null);
     setActionError(null);
+    setFileMenu(null);
     setSync(EMPTY_SYNC);
     setStatus(EMPTY_STATUS);
     setCommits([]);
@@ -246,6 +380,18 @@ export function WorktreeReview({ worktreePath, panelStorage }: WorktreeReviewPro
     void refreshStatus();
     void refreshSync();
   }, [worktreePath, refreshCommits, refreshStatus, refreshSync]);
+
+  useEffect(() => {
+    if (loadingGraph || loadingStatus) return;
+    setSelectedGraphLine((previous) => {
+      if (previous?.kind === "uncommitted" && status.hasChanges) return previous;
+      if (previous?.kind === "commit" && commits.some((commit) => commit.id === previous.id)) {
+        return previous;
+      }
+      if (status.hasChanges) return { kind: "uncommitted" };
+      return commits[0] ? { kind: "commit", id: commits[0].id } : null;
+    });
+  }, [commits, loadingGraph, loadingStatus, status.hasChanges]);
 
   useEffect(() => {
     const id = window.setInterval(() => {
@@ -257,12 +403,38 @@ export function WorktreeReview({ worktreePath, panelStorage }: WorktreeReviewPro
   }, [refreshStatus, refreshCommits, refreshSync]);
 
   useEffect(() => {
+    setCommitDetails(null);
+    setCommitDetailsError(null);
+    setSelectedFile(null);
+    setPreview(null);
+    setDiffError(null);
+    if (!selectedCommitId) {
+      setLoadingCommitDetails(false);
+      return;
+    }
+    void loadCommitDetails(selectedCommitId);
+  }, [selectedCommitId, loadCommitDetails]);
+
+  useEffect(() => {
     if (!selectedFile) {
       setPreview(null);
       return;
     }
     void loadDiff(selectedFile);
   }, [selectedFile, loadDiff]);
+
+  function handleGraphSelection(selection: GraphSelection) {
+    setSelectedGraphLine(selection);
+    setSelectedFile(null);
+    setPreview(null);
+    setDiffError(null);
+  }
+
+  function handleFileContextMenu(event: React.MouseEvent, path: string) {
+    event.preventDefault();
+    event.stopPropagation();
+    setFileMenu({ x: event.clientX, y: event.clientY, path });
+  }
 
   async function handleToggleStage(file: StatusFile) {
     setBusyStage(true);
@@ -315,6 +487,8 @@ export function WorktreeReview({ worktreePath, panelStorage }: WorktreeReviewPro
       });
       setCommitOpen(false);
       setCommitMessage("");
+      setSelectedGraphLine(null);
+      setCommits([]);
       setSelectedFile(null);
       setPreview(null);
       await refreshStatus({ silent: true });
@@ -413,7 +587,7 @@ export function WorktreeReview({ worktreePath, panelStorage }: WorktreeReviewPro
           <span>
             {pushBusy
               ? "Pushing…"
-              : sync.ahead > 0
+              : sync.hasRemoteBranch && sync.ahead > 0
                 ? `Push (${sync.ahead})`
                 : "Push"}
           </span>
@@ -492,6 +666,8 @@ export function WorktreeReview({ worktreePath, panelStorage }: WorktreeReviewPro
               commits={commits}
               hasChanges={status.hasChanges}
               loading={loadingGraph || loadingStatus}
+              selected={selectedGraphLine}
+              onSelect={handleGraphSelection}
             />
           </div>
         </Panel>
@@ -516,17 +692,29 @@ export function WorktreeReview({ worktreePath, panelStorage }: WorktreeReviewPro
                   >
                     <Panel defaultSize={50} minSize={15}>
                       <div className="panel-fill">
-                        <StatusFileSection
-                          title="Staged files"
-                          files={status.staged}
-                          staged
-                          selected={selectedFile}
-                          busy={busyStage}
-                          emptyLabel="No staged files"
-                          onToggleStage={handleToggleStage}
-                          onToggleAll={() => void handleToggleAll(true)}
-                          onSelectFile={setSelectedFile}
-                        />
+                        {selectedCommit ? (
+                          <CommitFileSection
+                            commitId={selectedCommit.id}
+                            files={commitDetails?.files ?? []}
+                            selected={selectedFile}
+                            loading={loadingCommitDetails}
+                            onSelectFile={setSelectedFile}
+                            onContextMenu={handleFileContextMenu}
+                          />
+                        ) : (
+                          <StatusFileSection
+                            title="Staged files"
+                            files={status.staged}
+                            staged
+                            selected={selectedFile}
+                            busy={busyStage}
+                            emptyLabel="No staged files"
+                            onToggleStage={handleToggleStage}
+                            onToggleAll={() => void handleToggleAll(true)}
+                            onSelectFile={setSelectedFile}
+                            onContextMenu={handleFileContextMenu}
+                          />
+                        )}
                       </div>
                     </Panel>
 
@@ -534,17 +722,27 @@ export function WorktreeReview({ worktreePath, panelStorage }: WorktreeReviewPro
 
                     <Panel defaultSize={50} minSize={15}>
                       <div className="panel-fill">
-                        <StatusFileSection
-                          title="Unstaged files"
-                          files={status.unstaged}
-                          staged={false}
-                          selected={selectedFile}
-                          busy={busyStage}
-                          emptyLabel="No unstaged files"
-                          onToggleStage={handleToggleStage}
-                          onToggleAll={() => void handleToggleAll(false)}
-                          onSelectFile={setSelectedFile}
-                        />
+                        {selectedCommit ? (
+                          <CommitDetailsSection
+                            commit={selectedCommit}
+                            details={commitDetails}
+                            loading={loadingCommitDetails}
+                            error={commitDetailsError}
+                          />
+                        ) : (
+                          <StatusFileSection
+                            title="Unstaged files"
+                            files={status.unstaged}
+                            staged={false}
+                            selected={selectedFile}
+                            busy={busyStage}
+                            emptyLabel="No unstaged files"
+                            onToggleStage={handleToggleStage}
+                            onToggleAll={() => void handleToggleAll(false)}
+                            onSelectFile={setSelectedFile}
+                            onContextMenu={handleFileContextMenu}
+                          />
+                        )}
                       </div>
                     </Panel>
                   </PanelGroup>
@@ -567,6 +765,29 @@ export function WorktreeReview({ worktreePath, panelStorage }: WorktreeReviewPro
           </div>
         </Panel>
       </PanelGroup>
+
+      {fileMenu && (
+        <ContextMenu
+          x={fileMenu.x}
+          y={fileMenu.y}
+          items={[
+            {
+              id: "copy-path",
+              label: "Copy path",
+              onClick: () => void navigator.clipboard?.writeText(fileMenu.path),
+            },
+            {
+              id: "copy-full-path",
+              label: "Copy full path",
+              onClick: () =>
+                void navigator.clipboard?.writeText(
+                  fullFilePath(worktreePath, fileMenu.path),
+                ),
+            },
+          ] satisfies ContextMenuItem[]}
+          onClose={() => setFileMenu(null)}
+        />
+      )}
     </div>
   );
 }

@@ -1,4 +1,4 @@
-import type { SelectedFile, StatusFile } from "../types";
+import type { CommitFile, SelectedFile, StatusFile } from "../types";
 
 type StatusFileSectionProps = {
   title: string;
@@ -10,6 +10,7 @@ type StatusFileSectionProps = {
   onToggleStage: (file: StatusFile) => void;
   onToggleAll: () => void;
   onSelectFile: (file: SelectedFile) => void;
+  onContextMenu: (event: React.MouseEvent, path: string) => void;
 };
 
 function statusIcon(status: string): string {
@@ -50,6 +51,7 @@ function FileRow({
   disabled,
   onToggle,
   onSelect,
+  onContextMenu,
 }: {
   file: StatusFile;
   checked: boolean;
@@ -57,9 +59,10 @@ function FileRow({
   disabled: boolean;
   onToggle: () => void;
   onSelect: () => void;
+  onContextMenu: (event: React.MouseEvent, path: string) => void;
 }) {
   return (
-    <li>
+    <li onContextMenu={(event) => onContextMenu(event, file.path)}>
       <div className={`status-file ${selected ? "selected" : ""}`}>
         <input
           type="checkbox"
@@ -93,6 +96,7 @@ export function StatusFileSection({
   onToggleStage,
   onToggleAll,
   onSelectFile,
+  onContextMenu,
 }: StatusFileSectionProps) {
   const hasFiles = files.length > 0;
 
@@ -136,7 +140,60 @@ export function StatusFileSection({
             disabled={busy}
             onToggle={() => onToggleStage(file)}
             onSelect={() => onSelectFile({ path: file.path, staged })}
+            onContextMenu={onContextMenu}
           />
+        ))}
+      </ul>
+    </section>
+  );
+}
+
+type CommitFileSectionProps = {
+  commitId: string;
+  files: CommitFile[];
+  selected: SelectedFile | null;
+  loading: boolean;
+  onSelectFile: (file: SelectedFile) => void;
+  onContextMenu: (event: React.MouseEvent, path: string) => void;
+};
+
+export function CommitFileSection({
+  commitId,
+  files,
+  selected,
+  loading,
+  onSelectFile,
+  onContextMenu,
+}: CommitFileSectionProps) {
+  return (
+    <section className="files-section">
+      <header className="pane-header files-header">
+        <span>Committed files</span>
+        <span className="pane-count">{files.length}</span>
+      </header>
+      <ul className="status-list">
+        {loading && <li className="pane-empty-inline">Loading files…</li>}
+        {!loading && files.length === 0 && (
+          <li className="pane-empty-inline">No committed files</li>
+        )}
+        {!loading && files.map((file) => (
+          <li
+            key={`${commitId}:${file.path}`}
+            onContextMenu={(event) => onContextMenu(event, file.path)}
+          >
+            <button
+              type="button"
+              className={`commit-file${selected?.commitId === commitId && selected.path === file.path ? " selected" : ""}`}
+              onClick={() => onSelectFile({ path: file.path, staged: false, commitId })}
+            >
+              <span className={`status-badge ${statusClass(file.status)}`}>
+                {statusIcon(file.status)}
+              </span>
+              <span className="status-path" title={file.path}>
+                {file.path}
+              </span>
+            </button>
+          </li>
         ))}
       </ul>
     </section>
