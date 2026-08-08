@@ -150,8 +150,8 @@ export function ProjectSidebar({ selection, onSelect }: ProjectSidebarProps) {
 
   const projectsRef = useRef(projects);
   const treesRef = useRef(trees);
-  const loadingWorktreesRef = useRef(loadingWorktrees);
   const selectionRef = useRef(selection);
+  const inflightRef = useRef<Record<string, Promise<void>>>({});
 
   useEffect(() => {
     projectsRef.current = projects;
@@ -160,10 +160,6 @@ export function ProjectSidebar({ selection, onSelect }: ProjectSidebarProps) {
   useEffect(() => {
     treesRef.current = trees;
   }, [trees]);
-
-  useEffect(() => {
-    loadingWorktreesRef.current = loadingWorktrees;
-  }, [loadingWorktrees]);
 
   useEffect(() => {
     selectionRef.current = selection;
@@ -210,6 +206,13 @@ export function ProjectSidebar({ selection, onSelect }: ProjectSidebarProps) {
       projectPath: string,
       options?: { silent?: boolean; extraPaths?: string[] },
     ) => {
+      const existing = inflightRef.current[projectPath];
+      if (existing) {
+        await existing;
+        // Join in-flight poll; re-run only when caller has new extras.
+        if (!options?.extraPaths) return;
+      }
+
       const silent = options?.silent ?? false;
       if (!silent) {
         setError(null);
@@ -220,25 +223,31 @@ export function ProjectSidebar({ selection, onSelect }: ProjectSidebarProps) {
         options?.extraPaths ??
         (project ? extraPathsFor(project) : []);
 
-      try {
-        // One fetch with status — avoids clean→dirty marker flash on poll.
-        const full = await invoke<Worktree[]>("list_worktrees_with_status", {
-          path: projectPath,
-        });
-        applyTrees(projectPath, splitTrees(full, projectPath, extras));
-      } catch (e) {
-        if (!silent) {
-          setError(String(e));
+      const run = (async () => {
+        try {
+          // One fetch with status — avoids clean→dirty marker flash on poll.
+          const full = await invoke<Worktree[]>("list_worktrees_with_status", {
+            path: projectPath,
+          });
+          applyTrees(projectPath, splitTrees(full, projectPath, extras));
+        } catch (e) {
+          if (!silent) {
+            setError(String(e));
+          }
+          if (!(projectPath in treesRef.current)) {
+            applyTrees(projectPath, { root: null, extras: [] });
+          }
+        } finally {
+          delete inflightRef.current[projectPath];
+          setLoadingWorktrees((prev) => {
+            if (!prev[projectPath]) return prev;
+            return { ...prev, [projectPath]: false };
+          });
         }
-        if (!(projectPath in treesRef.current)) {
-          applyTrees(projectPath, { root: null, extras: [] });
-        }
-      } finally {
-        setLoadingWorktrees((prev) => {
-          if (!prev[projectPath]) return prev;
-          return { ...prev, [projectPath]: false };
-        });
-      }
+      })();
+
+      inflightRef.current[projectPath] = run;
+      return run;
     },
     [applyTrees],
   );
@@ -248,19 +257,16 @@ export function ProjectSidebar({ selection, onSelect }: ProjectSidebarProps) {
     if (list.length === 0) return;
 
     await Promise.all(
-      list.map((project) => {
-        if (loadingWorktreesRef.current[project.path]) {
-          return Promise.resolve();
-        }
-        return loadWorktrees(project.path, { silent: true });
-      }),
+      list.map((project) => loadWorktrees(project.path, { silent: true })),
     );
   }, [loadWorktrees]);
 
   const projectPathsKey = projects.map((p) => p.path).join("\0");
   useEffect(() => {
-    if (!projectsReady || projects.length === 0) return;
-    for (const project of projects) {
+    if (!projectsReady) return;
+    const list = projectsRef.current;
+    if (list.length === 0) return;
+    for (const project of list) {
       if (!(project.path in treesRef.current)) {
         setLoadingWorktrees((prev) => ({ ...prev, [project.path]: true }));
       }
@@ -268,7 +274,8 @@ export function ProjectSidebar({ selection, onSelect }: ProjectSidebarProps) {
         silent: project.path in treesRef.current,
       });
     }
-  }, [projectsReady, projectPathsKey, loadWorktrees, projects]);
+    // projectPathsKey covers path add/remove; extras use loadWorktrees call sites.
+  }, [projectsReady, projectPathsKey, loadWorktrees]);
 
   // Pause poll while Add worktree modal open so modal list stays stable.
   useEffect(() => {
@@ -430,18 +437,38 @@ export function ProjectSidebar({ selection, onSelect }: ProjectSidebarProps) {
       return;
     }
 
+    const entry = treesRef.current[projectPath];
+    const wt =
+      entry?.extras.find((w) => w.path === worktreePath) ??
+      (entry?.root?.path === worktreePath ? entry.root : null);
+    const dirty = !!wt?.hasChanges;
+
     const confirmed = window.confirm(
-      `Delete worktree from git?\n\n${worktreePath}\n\nThis removes the worktree directory.`,
+      dirty
+        ? `Delete worktree from git?\n\n${worktreePath}\n\nThis worktree has uncommitted changes. They will be permanently discarded.`
+        : `Delete worktree from git?\n\n${worktreePath}\n\nThis removes the worktree directory.`,
     );
     if (!confirmed) return;
 
     setError(null);
     try {
-      await invoke("remove_worktree", {
-        repo: projectPath,
-        path: worktreePath,
-        force: true,
-      });
+      try {
+        await invoke("remove_worktree", {
+          repo: projectPath,
+          path: worktreePath,
+          force: false,
+        });
+      } catch {
+        const forceOk = window.confirm(
+          `Git refused a normal remove (dirty or locked worktree).\n\nForce delete and discard all local changes in:\n${worktreePath}`,
+        );
+        if (!forceOk) return;
+        await invoke("remove_worktree", {
+          repo: projectPath,
+          path: worktreePath,
+          force: true,
+        });
+      }
       closeWorktreeFromList(projectPath, worktreePath);
     } catch (e) {
       setError(String(e));

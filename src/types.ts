@@ -22,7 +22,6 @@ export type Commit = {
   date: string;
   subject: string;
   refs: string[];
-  parentIds: string[];
 };
 
 export type StatusFile = {

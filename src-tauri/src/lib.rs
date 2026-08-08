@@ -1,9 +1,76 @@
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use tauri::{AppHandle, Manager};
+
+#[cfg(windows)]
+const DEV_NULL: &str = "NUL";
+#[cfg(not(windows))]
+const DEV_NULL: &str = "/dev/null";
+
+fn same_path(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (fs::canonicalize(a), fs::canonicalize(b)) {
+        (Ok(ca), Ok(cb)) => ca == cb,
+        _ => false,
+    }
+}
+
+/// Reject absolute paths and `..` so file args stay inside the worktree.
+fn repo_relative_file(file: &str) -> Result<&str, String> {
+    let path = Path::new(file);
+    if path.as_os_str().is_empty() {
+        return Err("empty file path".into());
+    }
+    if path.is_absolute() {
+        return Err("file path must be relative to the worktree".into());
+    }
+    for component in path.components() {
+        match component {
+            Component::Normal(_) | Component::CurDir => {}
+            Component::Prefix(_) | Component::RootDir | Component::ParentDir => {
+                return Err("file path must be relative to the worktree".into());
+            }
+        }
+    }
+    Ok(file)
+}
+
+fn write_atomic(path: &Path, data: &str) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("no parent for {}", path.display()))?;
+    fs::create_dir_all(parent).map_err(|e| format!("create app data dir: {e}"))?;
+    let tmp = parent.join(format!(
+        ".{}.tmp",
+        path.file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("data")
+    ));
+    fs::write(&tmp, data).map_err(|e| format!("write temp: {e}"))?;
+    fs::rename(&tmp, path).map_err(|e| format!("rename temp: {e}"))
+}
+
+fn read_json_file<T: DeserializeOwned + Default>(path: &Path) -> Result<T, String> {
+    if !path.exists() {
+        return Ok(T::default());
+    }
+    let data = fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    if data.trim().is_empty() {
+        return Ok(T::default());
+    }
+    serde_json::from_str(&data).map_err(|e| format!("parse {}: {e}", path.display()))
+}
+
+fn write_json_file<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
+    let data =
+        serde_json::to_string_pretty(value).map_err(|e| format!("serialize: {e}"))?;
+    write_atomic(path, &data)
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -206,9 +273,16 @@ fn validate_project(path: String) -> Result<ProjectInfo, String> {
         return Err("directory is not a git repository".into());
     }
 
+    let toplevel = git(&repo, &["rev-parse", "--show-toplevel"])?
+        .trim()
+        .to_string();
+    if toplevel.is_empty() {
+        return Err("could not resolve repository root".into());
+    }
+
     Ok(ProjectInfo {
-        name: path_name(&path),
-        path,
+        name: path_name(&toplevel),
+        path: toplevel,
         worktrees: Vec::new(),
     })
 }
@@ -239,11 +313,15 @@ fn remove_worktree(repo: String, path: String, force: bool) -> Result<(), String
     }
 
     // Never delete the main worktree (repo root).
-    let main = list_worktrees_basic(&repo_path)?
+    let main_path = list_worktrees_basic(&repo_path)?
         .into_iter()
         .next()
-        .map(|w| w.path);
-    if main.as_deref() == Some(path.as_str()) || path == repo {
+        .map(|w| PathBuf::from(w.path));
+    if main_path
+        .as_ref()
+        .is_some_and(|main| same_path(main, &wt_path))
+        || same_path(&repo_path, &wt_path)
+    {
         return Err("cannot delete the main worktree".into());
     }
 
@@ -265,7 +343,6 @@ pub struct CommitInfo {
     pub date: String,
     pub subject: String,
     pub refs: Vec<String>,
-    pub parent_ids: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -294,7 +371,7 @@ fn list_commits(path: String, limit: Option<u32>) -> Result<Vec<CommitInfo>, Str
             "log",
             &format!("--max-count={max}"),
             "--date=iso-strict",
-            "--pretty=format:%H%x1f%h%x1f%an%x1f%ad%x1f%s%x1f%P%x1f%D",
+            "--pretty=format:%H%x1f%h%x1f%an%x1f%ad%x1f%s%x1f%D",
         ],
     )?;
     if code != 0 {
@@ -308,17 +385,16 @@ fn list_commits(path: String, limit: Option<u32>) -> Result<Vec<CommitInfo>, Str
         });
     }
 
-
     let mut commits = Vec::new();
     for line in out.lines() {
         if line.is_empty() {
             continue;
         }
         let parts: Vec<&str> = line.split('\x1f').collect();
-        if parts.len() < 7 {
+        if parts.len() < 6 {
             continue;
         }
-        let refs = parts[6]
+        let refs = parts[5]
             .split(", ")
             .map(str::trim)
             .filter(|s| !s.is_empty())
@@ -329,10 +405,6 @@ fn list_commits(path: String, limit: Option<u32>) -> Result<Vec<CommitInfo>, Str
                     .to_string()
             })
             .collect();
-        let parent_ids = parts[5]
-            .split_whitespace()
-            .map(str::to_string)
-            .collect();
         commits.push(CommitInfo {
             id: parts[0].to_string(),
             short_id: parts[1].to_string(),
@@ -340,7 +412,6 @@ fn list_commits(path: String, limit: Option<u32>) -> Result<Vec<CommitInfo>, Str
             date: parts[3].to_string(),
             subject: parts[4].to_string(),
             refs,
-            parent_ids,
         });
     }
     Ok(commits)
@@ -433,23 +504,12 @@ fn worktree_status(path: String) -> Result<WorktreeStatus, String> {
     })
 }
 
-#[tauri::command]
-fn stage_file(path: String, file: String) -> Result<(), String> {
-    let repo = PathBuf::from(&path);
-    git(&repo, &["add", "--", &file])?;
-    Ok(())
-}
-
-#[tauri::command]
-fn unstage_file(path: String, file: String) -> Result<(), String> {
-    let repo = PathBuf::from(&path);
-    git(&repo, &["restore", "--staged", "--", &file])?;
-    Ok(())
-}
-
 fn git_paths(repo: &Path, subcommand: &[&str], files: &[String]) -> Result<(), String> {
     if files.is_empty() {
         return Ok(());
+    }
+    for file in files {
+        repo_relative_file(file)?;
     }
     let mut cmd = Command::new("git");
     cmd.arg("-C").arg(repo);
@@ -475,15 +535,23 @@ fn git_paths(repo: &Path, subcommand: &[&str], files: &[String]) -> Result<(), S
 }
 
 #[tauri::command]
+fn stage_file(path: String, file: String) -> Result<(), String> {
+    git_paths(&PathBuf::from(path), &["add"], &[file])
+}
+
+#[tauri::command]
+fn unstage_file(path: String, file: String) -> Result<(), String> {
+    git_paths(&PathBuf::from(path), &["restore", "--staged"], &[file])
+}
+
+#[tauri::command]
 fn stage_files(path: String, files: Vec<String>) -> Result<(), String> {
-    let repo = PathBuf::from(&path);
-    git_paths(&repo, &["add"], &files)
+    git_paths(&PathBuf::from(path), &["add"], &files)
 }
 
 #[tauri::command]
 fn unstage_files(path: String, files: Vec<String>) -> Result<(), String> {
-    let repo = PathBuf::from(&path);
-    git_paths(&repo, &["restore", "--staged"], &files)
+    git_paths(&PathBuf::from(path), &["restore", "--staged"], &files)
 }
 
 #[tauri::command]
@@ -583,15 +651,16 @@ fn remote_sync_status(path: String) -> Result<SyncStatus, String> {
     }
 
     if !remote_branch_exists(&repo, &branch) {
-        // New local branch — pushable if HEAD exists.
-        let has_head = git_output(&repo, &["rev-parse", "--verify", "HEAD"])
-            .map(|(code, _, _)| code == 0)
-            .unwrap_or(false);
+        // New local branch — count commits as ahead (nothing on origin yet).
+        let ahead = git(&repo, &["rev-list", "--count", "HEAD"])
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0);
         return Ok(SyncStatus {
             branch: Some(branch),
-            ahead: if has_head { 1 } else { 0 },
+            ahead,
             behind: 0,
-            can_push: has_head,
+            can_push: ahead > 0,
             can_pull: false,
         });
     }
@@ -729,7 +798,7 @@ fn text_diff(repo: &Path, file: &str, staged: bool) -> Result<String, String> {
     )?;
     let is_untracked = status.lines().any(|l| l.starts_with("??"));
     if is_untracked {
-        return git_diff(repo, &["diff", "--no-index", "--", "/dev/null", file]);
+        return git_diff(repo, &["diff", "--no-index", "--", DEV_NULL, file]);
     }
 
     git_diff(repo, &["diff", "--", file])
@@ -785,6 +854,7 @@ fn load_image_bytes(repo: &Path, file: &str, staged: bool) -> Result<(Vec<u8>, S
 
 #[tauri::command]
 fn file_preview(path: String, file: String, staged: bool) -> Result<FilePreview, String> {
+    repo_relative_file(&file)?;
     let repo = PathBuf::from(&path);
 
     if let Some(mime) = image_mime(&file) {
@@ -793,6 +863,16 @@ fn file_preview(path: String, file: String, staged: bool) -> Result<FilePreview,
                 if bytes.is_empty() {
                     return Ok(FilePreview::Binary {
                         message: "Empty image file".into(),
+                    });
+                }
+                // Cap IPC payload size for large images.
+                const MAX_IMAGE_BYTES: usize = 8 * 1024 * 1024;
+                if bytes.len() > MAX_IMAGE_BYTES {
+                    return Ok(FilePreview::Binary {
+                        message: format!(
+                            "Image too large to preview ({} bytes)",
+                            bytes.len()
+                        ),
                     });
                 }
                 return Ok(FilePreview::Image {
@@ -825,17 +905,6 @@ fn file_preview(path: String, file: String, staged: bool) -> Result<FilePreview,
     Ok(FilePreview::Text { lines })
 }
 
-#[tauri::command]
-fn file_diff(path: String, file: String, staged: bool) -> Result<String, String> {
-    match file_preview(path, file, staged)? {
-        FilePreview::Text { lines } => Ok(lines.join("\n")),
-        FilePreview::Image { label, .. } => Ok(format!("[image: {label}]")),
-        FilePreview::Binary { message } => Ok(message),
-    }
-}
-
-
-
 fn app_data_file(app: &AppHandle, name: &str) -> Result<PathBuf, String> {
     let dir = app
         .path()
@@ -844,64 +913,24 @@ fn app_data_file(app: &AppHandle, name: &str) -> Result<PathBuf, String> {
     Ok(dir.join(name))
 }
 
-fn projects_file(app: &AppHandle) -> Result<PathBuf, String> {
-    app_data_file(app, "projects.json")
-}
-
-fn panel_layouts_file(app: &AppHandle) -> Result<PathBuf, String> {
-    app_data_file(app, "panel-layouts.json")
-}
-
 #[tauri::command]
 fn load_panel_layouts(app: AppHandle) -> Result<HashMap<String, String>, String> {
-    let path = panel_layouts_file(&app)?;
-    if !path.exists() {
-        return Ok(HashMap::new());
-    }
-    let data = fs::read_to_string(&path).map_err(|e| format!("read panel layouts: {e}"))?;
-    if data.trim().is_empty() {
-        return Ok(HashMap::new());
-    }
-    serde_json::from_str(&data).map_err(|e| format!("parse panel layouts: {e}"))
+    read_json_file(&app_data_file(&app, "panel-layouts.json")?)
 }
 
 #[tauri::command]
 fn save_panel_layouts(app: AppHandle, layouts: HashMap<String, String>) -> Result<(), String> {
-    let path = panel_layouts_file(&app)?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("create app data dir: {e}"))?;
-    }
-    let data =
-        serde_json::to_string_pretty(&layouts).map_err(|e| format!("serialize layouts: {e}"))?;
-    fs::write(&path, data).map_err(|e| format!("write panel layouts: {e}"))
+    write_json_file(&app_data_file(&app, "panel-layouts.json")?, &layouts)
 }
-
 
 #[tauri::command]
 fn load_projects(app: AppHandle) -> Result<Vec<ProjectInfo>, String> {
-    let path = projects_file(&app)?;
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-
-    let data = fs::read_to_string(&path).map_err(|e| format!("read projects: {e}"))?;
-    if data.trim().is_empty() {
-        return Ok(Vec::new());
-    }
-
-    serde_json::from_str(&data).map_err(|e| format!("parse projects: {e}"))
+    read_json_file(&app_data_file(&app, "projects.json")?)
 }
 
 #[tauri::command]
 fn save_projects(app: AppHandle, projects: Vec<ProjectInfo>) -> Result<(), String> {
-    let path = projects_file(&app)?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("create app data dir: {e}"))?;
-    }
-
-    let data =
-        serde_json::to_string_pretty(&projects).map_err(|e| format!("serialize projects: {e}"))?;
-    fs::write(&path, data).map_err(|e| format!("write projects: {e}"))
+    write_json_file(&app_data_file(&app, "projects.json")?, &projects)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -925,16 +954,11 @@ pub fn run() {
             push_origin,
             pull_origin,
             file_preview,
-            file_diff,
             load_projects,
             save_projects,
             load_panel_layouts,
             save_panel_layouts
         ])
-
-
-
-
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
@@ -994,6 +1018,14 @@ detached
         assert_eq!(parse_ahead_behind("2\t1\n"), (2, 1));
         assert_eq!(parse_ahead_behind("0 3"), (0, 3));
         assert_eq!(parse_ahead_behind(""), (0, 0));
+    }
+
+    #[test]
+    fn repo_relative_file_rejects_escape() {
+        assert!(repo_relative_file("src/main.rs").is_ok());
+        assert!(repo_relative_file("../secret").is_err());
+        assert!(repo_relative_file("/etc/passwd").is_err());
+        assert!(repo_relative_file("").is_err());
     }
 }
 

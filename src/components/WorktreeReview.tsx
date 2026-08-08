@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   Panel,
@@ -22,6 +22,12 @@ import { StatusFileSection } from "./StatusFiles";
 
 const REFRESH_MS = 10000;
 
+const EMPTY_STATUS: WorktreeStatus = {
+  staged: [],
+  unstaged: [],
+  hasChanges: false,
+};
+
 const EMPTY_SYNC: SyncStatus = {
   branch: null,
   ahead: 0,
@@ -35,13 +41,80 @@ type WorktreeReviewProps = {
   panelStorage: PanelGroupStorage;
 };
 
+function statusEqual(a: WorktreeStatus, b: WorktreeStatus): boolean {
+  if (a.hasChanges !== b.hasChanges) return false;
+  if (a.staged.length !== b.staged.length || a.unstaged.length !== b.unstaged.length) {
+    return false;
+  }
+  const same = (x: StatusFile, y: StatusFile) =>
+    x.path === y.path && x.status === y.status && x.staged === y.staged;
+  return (
+    a.staged.every((f, i) => same(f, b.staged[i])) &&
+    a.unstaged.every((f, i) => same(f, b.unstaged[i]))
+  );
+}
+
+function commitsEqual(a: Commit[], b: Commit[]): boolean {
+  if (a.length !== b.length) return false;
+  return a.every(
+    (c, i) =>
+      c.id === b[i]?.id &&
+      c.subject === b[i]?.subject &&
+      c.shortId === b[i]?.shortId &&
+      c.author === b[i]?.author &&
+      c.date === b[i]?.date &&
+      c.refs.length === b[i]?.refs.length &&
+      c.refs.every((r, j) => r === b[i]?.refs[j]),
+  );
+}
+
+function syncEqual(a: SyncStatus, b: SyncStatus): boolean {
+  return (
+    a.branch === b.branch &&
+    a.ahead === b.ahead &&
+    a.behind === b.behind &&
+    a.canPush === b.canPush &&
+    a.canPull === b.canPull
+  );
+}
+
+function fileStillPresent(file: SelectedFile, status: WorktreeStatus): boolean {
+  const list = file.staged ? status.staged : status.unstaged;
+  return list.some((f) => f.path === file.path);
+}
+
+/** After stage/unstage, keep focus on a sensible neighbor in the source list. */
+function pickAfterToggle(
+  wasStaged: boolean,
+  sourceIndex: number,
+  next: WorktreeStatus,
+): SelectedFile | null {
+  const primary = wasStaged ? next.staged : next.unstaged;
+  const secondary = wasStaged ? next.unstaged : next.staged;
+  if (primary.length > 0) {
+    const idx = sourceIndex < 0 ? 0 : Math.min(sourceIndex, primary.length - 1);
+    return { path: primary[idx].path, staged: wasStaged };
+  }
+  if (secondary.length > 0) {
+    return { path: secondary[0].path, staged: !wasStaged };
+  }
+  return null;
+}
+
+function pickAfterToggleAll(fromStaged: boolean, next: WorktreeStatus): SelectedFile | null {
+  if (fromStaged) {
+    if (next.unstaged.length > 0) return { path: next.unstaged[0].path, staged: false };
+    if (next.staged.length > 0) return { path: next.staged[0].path, staged: true };
+  } else {
+    if (next.staged.length > 0) return { path: next.staged[0].path, staged: true };
+    if (next.unstaged.length > 0) return { path: next.unstaged[0].path, staged: false };
+  }
+  return null;
+}
+
 export function WorktreeReview({ worktreePath, panelStorage }: WorktreeReviewProps) {
   const [commits, setCommits] = useState<Commit[]>([]);
-  const [status, setStatus] = useState<WorktreeStatus>({
-    staged: [],
-    unstaged: [],
-    hasChanges: false,
-  });
+  const [status, setStatus] = useState<WorktreeStatus>(EMPTY_STATUS);
   const [sync, setSync] = useState<SyncStatus>(EMPTY_SYNC);
   const [selectedFile, setSelectedFile] = useState<SelectedFile | null>(null);
   const [preview, setPreview] = useState<FilePreview | null>(null);
@@ -59,71 +132,49 @@ export function WorktreeReview({ worktreePath, panelStorage }: WorktreeReviewPro
   const [pullBusy, setPullBusy] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
 
+  const pathRef = useRef(worktreePath);
+  const selectedRef = useRef(selectedFile);
+  pathRef.current = worktreePath;
+  selectedRef.current = selectedFile;
+
   const refreshSync = useCallback(async () => {
+    const forPath = worktreePath;
     try {
       const next = await invoke<SyncStatus>("remote_sync_status", {
-        path: worktreePath,
+        path: forPath,
       });
-      setSync((prev) =>
-        prev.branch === next.branch &&
-        prev.ahead === next.ahead &&
-        prev.behind === next.behind &&
-        prev.canPush === next.canPush &&
-        prev.canPull === next.canPull
-          ? prev
-          : next,
-      );
+      if (pathRef.current !== forPath) return;
+      setSync((prev) => (syncEqual(prev, next) ? prev : next));
     } catch {
-      setSync((prev) =>
-        prev === EMPTY_SYNC ||
-        (!prev.branch &&
-          prev.ahead === 0 &&
-          prev.behind === 0 &&
-          !prev.canPush &&
-          !prev.canPull)
-          ? prev
-          : EMPTY_SYNC,
-      );
+      if (pathRef.current !== forPath) return;
+      setSync((prev) => (syncEqual(prev, EMPTY_SYNC) ? prev : EMPTY_SYNC));
     }
   }, [worktreePath]);
 
   const refreshStatus = useCallback(
     async (options?: { silent?: boolean }): Promise<WorktreeStatus | null> => {
       const silent = options?.silent ?? false;
+      const forPath = worktreePath;
       if (!silent) setLoadingStatus(true);
       try {
         const next = await invoke<WorktreeStatus>("worktree_status", {
-          path: worktreePath,
+          path: forPath,
         });
-        setStatus((prev) => {
-          if (
-            prev.hasChanges === next.hasChanges &&
-            prev.staged.length === next.staged.length &&
-            prev.unstaged.length === next.unstaged.length &&
-            prev.staged.every(
-              (f, i) =>
-                f.path === next.staged[i]?.path &&
-                f.status === next.staged[i]?.status &&
-                f.staged === next.staged[i]?.staged,
-            ) &&
-            prev.unstaged.every(
-              (f, i) =>
-                f.path === next.unstaged[i]?.path &&
-                f.status === next.unstaged[i]?.status &&
-                f.staged === next.unstaged[i]?.staged,
-            )
-          ) {
-            return prev;
-          }
-          return next;
-        });
+        if (pathRef.current !== forPath) return null;
+        setStatus((prev) => (statusEqual(prev, next) ? prev : next));
+        const sel = selectedRef.current;
+        if (sel && !fileStillPresent(sel, next)) {
+          setSelectedFile(null);
+          setPreview(null);
+        }
         if (!silent) setError(null);
         return next;
       } catch (e) {
+        if (pathRef.current !== forPath) return null;
         if (!silent) setError(String(e));
         return null;
       } finally {
-        if (!silent) setLoadingStatus(false);
+        if (pathRef.current === forPath && !silent) setLoadingStatus(false);
       }
     },
     [worktreePath],
@@ -132,34 +183,20 @@ export function WorktreeReview({ worktreePath, panelStorage }: WorktreeReviewPro
   const refreshCommits = useCallback(
     async (options?: { silent?: boolean }) => {
       const silent = options?.silent ?? false;
+      const forPath = worktreePath;
       if (!silent) setLoadingGraph(true);
       try {
         const list = await invoke<Commit[]>("list_commits", {
-          path: worktreePath,
+          path: forPath,
           limit: 80,
         });
-        setCommits((prev) => {
-          if (
-            prev.length === list.length &&
-            prev.every(
-              (c, i) =>
-                c.id === list[i]?.id &&
-                c.subject === list[i]?.subject &&
-                c.shortId === list[i]?.shortId &&
-                c.author === list[i]?.author &&
-                c.date === list[i]?.date &&
-                c.refs.length === list[i]?.refs.length &&
-                c.refs.every((r, j) => r === list[i]?.refs[j]),
-            )
-          ) {
-            return prev;
-          }
-          return list;
-        });
+        if (pathRef.current !== forPath) return;
+        setCommits((prev) => (commitsEqual(prev, list) ? prev : list));
       } catch (e) {
+        if (pathRef.current !== forPath) return;
         if (!silent) setError(String(e));
       } finally {
-        if (!silent) setLoadingGraph(false);
+        if (pathRef.current === forPath && !silent) setLoadingGraph(false);
       }
     },
     [worktreePath],
@@ -167,20 +204,28 @@ export function WorktreeReview({ worktreePath, panelStorage }: WorktreeReviewPro
 
   const loadDiff = useCallback(
     async (file: SelectedFile) => {
+      const forPath = worktreePath;
+      const forFile = file;
       setLoadingDiff(true);
       setDiffError(null);
       try {
         const next = await invoke<FilePreview>("file_preview", {
-          path: worktreePath,
-          file: file.path,
-          staged: file.staged,
+          path: forPath,
+          file: forFile.path,
+          staged: forFile.staged,
         });
+        if (pathRef.current !== forPath) return;
+        const sel = selectedRef.current;
+        if (!sel || sel.path !== forFile.path || sel.staged !== forFile.staged) return;
         setPreview(next);
       } catch (e) {
+        if (pathRef.current !== forPath) return;
+        const sel = selectedRef.current;
+        if (!sel || sel.path !== forFile.path || sel.staged !== forFile.staged) return;
         setPreview(null);
         setDiffError(String(e));
       } finally {
-        setLoadingDiff(false);
+        if (pathRef.current === forPath) setLoadingDiff(false);
       }
     },
     [worktreePath],
@@ -195,6 +240,8 @@ export function WorktreeReview({ worktreePath, panelStorage }: WorktreeReviewPro
     setCommitError(null);
     setActionError(null);
     setSync(EMPTY_SYNC);
+    setStatus(EMPTY_STATUS);
+    setCommits([]);
     void refreshCommits();
     void refreshStatus();
     void refreshSync();
@@ -234,32 +281,7 @@ export function WorktreeReview({ worktreePath, panelStorage }: WorktreeReviewPro
 
       const next = await refreshStatus({ silent: true });
       if (!next) return;
-
-      if (wasStaged) {
-        if (next.staged.length > 0) {
-          const idx =
-            sourceIndex < 0
-              ? 0
-              : Math.min(sourceIndex, next.staged.length - 1);
-          const pick = next.staged[idx];
-          setSelectedFile({ path: pick.path, staged: true });
-        } else if (next.unstaged.length > 0) {
-          setSelectedFile({ path: next.unstaged[0].path, staged: false });
-        } else {
-          setSelectedFile(null);
-        }
-      } else if (next.unstaged.length > 0) {
-        const idx =
-          sourceIndex < 0
-            ? 0
-            : Math.min(sourceIndex, next.unstaged.length - 1);
-        const pick = next.unstaged[idx];
-        setSelectedFile({ path: pick.path, staged: false });
-      } else if (next.staged.length > 0) {
-        setSelectedFile({ path: next.staged[0].path, staged: true });
-      } else {
-        setSelectedFile(null);
-      }
+      setSelectedFile(pickAfterToggle(wasStaged, sourceIndex, next));
     } catch (e) {
       setError(String(e));
     } finally {
@@ -356,22 +378,7 @@ export function WorktreeReview({ worktreePath, panelStorage }: WorktreeReviewPro
 
       const next = await refreshStatus({ silent: true });
       if (!next) return;
-
-      if (staged) {
-        if (next.unstaged.length > 0) {
-          setSelectedFile({ path: next.unstaged[0].path, staged: false });
-        } else if (next.staged.length > 0) {
-          setSelectedFile({ path: next.staged[0].path, staged: true });
-        } else {
-          setSelectedFile(null);
-        }
-      } else if (next.staged.length > 0) {
-        setSelectedFile({ path: next.staged[0].path, staged: true });
-      } else if (next.unstaged.length > 0) {
-        setSelectedFile({ path: next.unstaged[0].path, staged: false });
-      } else {
-        setSelectedFile(null);
-      }
+      setSelectedFile(pickAfterToggleAll(staged, next));
     } catch (e) {
       setError(String(e));
     } finally {

@@ -99,23 +99,15 @@ export function StatusFileSection({
   return (
     <section className="files-section">
       <header className="pane-header files-header">
-        <input
-          type="checkbox"
-          className="files-header-check"
-          checked={staged && hasFiles}
+        <button
+          type="button"
+          className="files-header-action"
           disabled={busy || !hasFiles}
-          onChange={onToggleAll}
-          title={
-            staged
-              ? "Unstage all files"
-              : "Stage all files"
-          }
-          aria-label={
-            staged
-              ? `Unstage all ${title.toLowerCase()}`
-              : `Stage all ${title.toLowerCase()}`
-          }
-        />
+          onClick={onToggleAll}
+          title={staged ? "Unstage all files" : "Stage all files"}
+        >
+          {staged ? "Unstage all" : "Stage all"}
+        </button>
         <span>{title}</span>
         <span className="pane-count">{files.length}</span>
       </header>
