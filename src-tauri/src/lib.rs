@@ -10,6 +10,8 @@ use tauri::{AppHandle, Manager};
 pub struct ProjectInfo {
     pub path: String,
     pub name: String,
+    #[serde(default)]
+    pub worktrees: Vec<String>,
 }
 
 
@@ -23,15 +25,6 @@ pub struct WorktreeInfo {
     pub has_changes: bool,
     pub has_stash: bool,
 }
-
-#[derive(Debug, Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct BranchInfo {
-    pub name: String,
-    pub is_current: bool,
-    pub is_remote: bool,
-}
-
 
 fn git(repo: &Path, args: &[&str]) -> Result<String, String> {
     let (code, stdout, stderr) = git_output(repo, args)?;
@@ -216,6 +209,7 @@ fn validate_project(path: String) -> Result<ProjectInfo, String> {
     Ok(ProjectInfo {
         name: path_name(&path),
         path,
+        worktrees: Vec::new(),
     })
 }
 
@@ -234,58 +228,33 @@ fn list_worktrees_with_status(path: String) -> Result<Vec<WorktreeInfo>, String>
     Ok(worktrees)
 }
 
-fn parse_branch_refs(output: &str, is_remote: bool) -> Vec<BranchInfo> {
-    let mut branches = Vec::new();
-    for line in output.lines() {
-        if line.is_empty() {
-            continue;
-        }
-        let mut parts = line.splitn(2, '\t');
-        let name = match parts.next() {
-            Some(n) if !n.is_empty() => n.to_string(),
-            _ => continue,
-        };
-        if is_remote && (name.ends_with("/HEAD") || name == "HEAD") {
-            continue;
-        }
-        let is_current = parts.next() == Some("*");
-        branches.push(BranchInfo {
-            name,
-            is_current,
-            is_remote,
-        });
-    }
-    branches
-}
-
+/// Remove a linked worktree from the repo (`git worktree remove`).
 #[tauri::command]
-fn list_branches(path: String) -> Result<Vec<BranchInfo>, String> {
-    let repo = PathBuf::from(&path);
-    let local = git(
-        &repo,
-        &[
-            "for-each-ref",
-            "--sort=-committerdate",
-            "--format=%(refname:short)\t%(HEAD)",
-            "refs/heads/",
-        ],
-    )?;
-    let remote = git(
-        &repo,
-        &[
-            "for-each-ref",
-            "--sort=-committerdate",
-            "--format=%(refname:short)\t%(HEAD)",
-            "refs/remotes/",
-        ],
-    )?;
+fn remove_worktree(repo: String, path: String, force: bool) -> Result<(), String> {
+    let repo_path = PathBuf::from(&repo);
+    let wt_path = PathBuf::from(&path);
 
-    let mut branches = parse_branch_refs(&local, false);
-    branches.extend(parse_branch_refs(&remote, true));
-    Ok(branches)
+    if !wt_path.exists() {
+        return Err("worktree path does not exist".into());
+    }
+
+    // Never delete the main worktree (repo root).
+    let main = list_worktrees_basic(&repo_path)?
+        .into_iter()
+        .next()
+        .map(|w| w.path);
+    if main.as_deref() == Some(path.as_str()) || path == repo {
+        return Err("cannot delete the main worktree".into());
+    }
+
+    let mut args = vec!["worktree", "remove"];
+    if force {
+        args.push("--force");
+    }
+    args.push(path.as_str());
+    git(&repo_path, &args)?;
+    Ok(())
 }
-
-
 
 #[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -819,7 +788,7 @@ pub fn run() {
             validate_project,
             list_worktrees,
             list_worktrees_with_status,
-            list_branches,
+            remove_worktree,
             list_commits,
             worktree_status,
             stage_file,
@@ -891,16 +860,7 @@ detached
         assert!(!worktree_has_stash(&Some("other".into()), &stashed));
         assert!(!worktree_has_stash(&None, &stashed));
     }
-
-    #[test]
-    fn parse_branch_refs_skips_remote_head() {
-        let input = "origin/main\t\norigin/HEAD\t\norigin/feature\t\n";
-        let list = parse_branch_refs(input, true);
-        assert_eq!(list.len(), 2);
-        assert_eq!(list[0].name, "origin/main");
-        assert!(!list[0].is_current);
-        assert!(list[0].is_remote);
-    }
 }
+
 
 

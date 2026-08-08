@@ -1,15 +1,28 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { flushSync } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
+import { Folder, FolderPlus, FolderTree } from "lucide-react";
 import { loadProjects, saveProjects } from "../storage";
-import type { Branch, Project, ProjectTab, Selection, Worktree } from "../types";
+import type { Project, Selection, Worktree } from "../types";
+import { AddWorktreeModal } from "./AddWorktreeModal";
+import { ContextMenu, type ContextMenuItem } from "./ContextMenu";
 
-const POLL_MS = 10000;
+const POLL_MS = 5000;
 
 type ProjectSidebarProps = {
   selection: Selection | null;
-  onSelect: (selection: Selection) => void;
+  onSelect: (selection: Selection | null) => void;
+};
+
+type MenuState = {
+  x: number;
+  y: number;
+  items: ContextMenuItem[];
+};
+
+type ProjectTrees = {
+  root: Worktree | null;
+  extras: Worktree[];
 };
 
 function Spinner({ label }: { label: string }) {
@@ -20,55 +33,132 @@ function Spinner({ label }: { label: string }) {
   );
 }
 
+function pickRoot(all: Worktree[], projectPath: string): Worktree | null {
+  return all.find((wt) => wt.path === projectPath) ?? all[0] ?? null;
+}
+
+function splitTrees(
+  all: Worktree[],
+  projectPath: string,
+  extraPaths: string[],
+): ProjectTrees {
+  const root = pickRoot(all, projectPath);
+  const byPath = new Map(all.map((wt) => [wt.path, wt]));
+  const extras = extraPaths
+    .filter((path) => path !== root?.path)
+    .map((path) => byPath.get(path))
+    .filter((wt): wt is Worktree => wt != null);
+  return { root, extras };
+}
+
+function extraPathsFor(project: Project): string[] {
+  return project.worktrees.filter((path) => path !== project.path);
+}
+
+function branchLabel(wt: Worktree | null): string | null {
+  if (!wt) return null;
+  return wt.branch ?? wt.name;
+}
+
+function WorktreeRow({
+  wt,
+  project,
+  selected,
+  onSelect,
+  onContextMenu,
+}: {
+  wt: Worktree;
+  project: Project;
+  selected: boolean;
+  onSelect: (path: string) => void;
+  onContextMenu: (e: React.MouseEvent, project: Project, wt: Worktree) => void;
+}) {
+  const classes = [
+    "worktree-item",
+    selected ? "selected" : "",
+    wt.hasChanges ? "has-changes" : "",
+    wt.hasStash ? "has-stash" : "",
+    !wt.hasChanges && !wt.hasStash ? "clean" : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
+
+  const status = [
+    wt.hasChanges ? "uncommitted changes" : null,
+    wt.hasStash ? "stashed changes" : null,
+  ]
+    .filter(Boolean)
+    .join(", ");
+
+  return (
+    <li>
+      <button
+        type="button"
+        className={classes}
+        title={status ? `${wt.path} (${status})` : wt.path}
+        onClick={() => onSelect(wt.path)}
+        onContextMenu={(e) => onContextMenu(e, project, wt)}
+        aria-selected={selected}
+      >
+        <span className="worktree-name">{wt.branch ?? wt.name}</span>
+        <span className="worktree-markers" aria-hidden>
+          {wt.hasChanges && (
+            <span className="marker changes" title="Uncommitted changes">
+              ●
+            </span>
+          )}
+          {wt.hasStash && (
+            <span className="marker stash" title="Stashed changes">
+              ▤
+            </span>
+          )}
+        </span>
+      </button>
+    </li>
+  );
+}
+
 export function ProjectSidebar({ selection, onSelect }: ProjectSidebarProps) {
   const [projects, setProjects] = useState<Project[]>([]);
   const [projectsReady, setProjectsReady] = useState(false);
-  const [expandedPath, setExpandedPath] = useState<string | null>(null);
-  const [activeTab, setActiveTab] = useState<Record<string, ProjectTab>>({});
-  const [worktrees, setWorktrees] = useState<Record<string, Worktree[]>>({});
-  const [branches, setBranches] = useState<Record<string, Branch[]>>({});
+  const [trees, setTrees] = useState<Record<string, ProjectTrees>>({});
   const [loadingWorktrees, setLoadingWorktrees] = useState<Record<string, boolean>>({});
-  const [loadingBranches, setLoadingBranches] = useState<Record<string, boolean>>({});
   const [error, setError] = useState<string | null>(null);
+  const [addForProject, setAddForProject] = useState<Project | null>(null);
+  const [menu, setMenu] = useState<MenuState | null>(null);
 
-  const expandedPathRef = useRef(expandedPath);
-  const activeTabRef = useRef(activeTab);
-  const worktreesRef = useRef(worktrees);
-  const branchesRef = useRef(branches);
+  const projectsRef = useRef(projects);
+  const treesRef = useRef(trees);
   const loadingWorktreesRef = useRef(loadingWorktrees);
-  const loadingBranchesRef = useRef(loadingBranches);
+  const selectionRef = useRef(selection);
 
   useEffect(() => {
-    expandedPathRef.current = expandedPath;
-  }, [expandedPath]);
+    projectsRef.current = projects;
+  }, [projects]);
 
   useEffect(() => {
-    activeTabRef.current = activeTab;
-  }, [activeTab]);
-
-
-  useEffect(() => {
-    worktreesRef.current = worktrees;
-  }, [worktrees]);
-
-  useEffect(() => {
-    branchesRef.current = branches;
-  }, [branches]);
+    treesRef.current = trees;
+  }, [trees]);
 
   useEffect(() => {
     loadingWorktreesRef.current = loadingWorktrees;
   }, [loadingWorktrees]);
 
   useEffect(() => {
-    loadingBranchesRef.current = loadingBranches;
-  }, [loadingBranches]);
+    selectionRef.current = selection;
+  }, [selection]);
 
   useEffect(() => {
     let cancelled = false;
     void loadProjects()
       .then((list) => {
         if (cancelled) return;
-        setProjects(list);
+        setProjects(
+          list.map((p) => ({
+            ...p,
+            worktrees: (p.worktrees ?? []).filter((path) => path !== p.path),
+          })),
+        );
         setProjectsReady(true);
       })
       .catch((e) => {
@@ -87,29 +177,49 @@ export function ProjectSidebar({ selection, onSelect }: ProjectSidebarProps) {
   }, [projects, projectsReady]);
 
   const loadWorktrees = useCallback(
-    async (projectPath: string, options?: { silent?: boolean }) => {
+    async (
+      projectPath: string,
+      options?: { silent?: boolean; extraPaths?: string[]; withStatus?: boolean },
+    ) => {
       const silent = options?.silent ?? false;
+      const withStatus = options?.withStatus ?? true;
       if (!silent) {
         setError(null);
       }
+
+      const project = projectsRef.current.find((p) => p.path === projectPath);
+      const extras =
+        options?.extraPaths ??
+        (project ? extraPathsFor(project) : []);
 
       try {
         const basic = await invoke<Worktree[]>("list_worktrees", {
           path: projectPath,
         });
-        setWorktrees((prev) => ({ ...prev, [projectPath]: basic }));
+        setTrees((prev) => ({
+          ...prev,
+          [projectPath]: splitTrees(basic, projectPath, extras),
+        }));
         setLoadingWorktrees((prev) => ({ ...prev, [projectPath]: false }));
 
-        const full = await invoke<Worktree[]>("list_worktrees_with_status", {
-          path: projectPath,
-        });
-        setWorktrees((prev) => ({ ...prev, [projectPath]: full }));
+        if (withStatus) {
+          const full = await invoke<Worktree[]>("list_worktrees_with_status", {
+            path: projectPath,
+          });
+          setTrees((prev) => ({
+            ...prev,
+            [projectPath]: splitTrees(full, projectPath, extras),
+          }));
+        }
       } catch (e) {
         if (!silent) {
           setError(String(e));
         }
-        if (!(projectPath in worktreesRef.current)) {
-          setWorktrees((prev) => ({ ...prev, [projectPath]: [] }));
+        if (!(projectPath in treesRef.current)) {
+          setTrees((prev) => ({
+            ...prev,
+            [projectPath]: { root: null, extras: [] },
+          }));
         }
         setLoadingWorktrees((prev) => ({ ...prev, [projectPath]: false }));
       }
@@ -117,67 +227,80 @@ export function ProjectSidebar({ selection, onSelect }: ProjectSidebarProps) {
     [],
   );
 
-  const loadBranches = useCallback(
-    async (projectPath: string, options?: { silent?: boolean }) => {
-      const silent = options?.silent ?? false;
-      if (!silent) {
-        setError(null);
-      }
+  const refreshAllProjects = useCallback(async () => {
+    const list = projectsRef.current;
+    if (list.length === 0) return;
 
-      try {
-        const list = await invoke<Branch[]>("list_branches", {
-          path: projectPath,
-        });
-        setBranches((prev) => ({ ...prev, [projectPath]: list }));
-      } catch (e) {
-        if (!silent) {
-          setError(String(e));
+    await Promise.all(
+      list.map((project) => {
+        if (loadingWorktreesRef.current[project.path]) {
+          return Promise.resolve();
         }
-        if (!(projectPath in branchesRef.current)) {
-          setBranches((prev) => ({ ...prev, [projectPath]: [] }));
-        }
-      } finally {
-        setLoadingBranches((prev) => ({ ...prev, [projectPath]: false }));
+        return loadWorktrees(project.path, { silent: true, withStatus: true });
+      }),
+    );
+  }, [loadWorktrees]);
+
+  const projectPathsKey = projects.map((p) => p.path).join("\0");
+  useEffect(() => {
+    if (!projectsReady || projects.length === 0) return;
+    for (const project of projects) {
+      if (!(project.path in treesRef.current)) {
+        setLoadingWorktrees((prev) => ({ ...prev, [project.path]: true }));
       }
-    },
-    [],
-  );
-
-  const refreshExpanded = useCallback(async () => {
-    const path = expandedPathRef.current;
-    if (!path) return;
-
-    const tab = activeTabRef.current[path] ?? "worktrees";
-    if (tab === "worktrees") {
-      if (loadingWorktreesRef.current[path]) return;
-      setLoadingWorktrees((prev) => ({ ...prev, [path]: true }));
-      await loadWorktrees(path, { silent: true });
-      return;
+      void loadWorktrees(project.path, {
+        silent: project.path in treesRef.current,
+      });
     }
-
-    if (loadingBranchesRef.current[path]) return;
-    setLoadingBranches((prev) => ({ ...prev, [path]: true }));
-    await loadBranches(path, { silent: true });
-  }, [loadWorktrees, loadBranches]);
+  }, [projectsReady, projectPathsKey, loadWorktrees, projects]);
 
   useEffect(() => {
-    if (!expandedPath) return;
+    if (!projectsReady || projects.length === 0) return;
 
     const id = window.setInterval(() => {
-      void refreshExpanded();
+      void refreshAllProjects();
     }, POLL_MS);
 
     const onFocus = () => {
-      void refreshExpanded();
+      void refreshAllProjects();
     };
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") {
+        void refreshAllProjects();
+      }
+    };
+
     window.addEventListener("focus", onFocus);
+    document.addEventListener("visibilitychange", onVisibility);
 
     return () => {
       window.clearInterval(id);
       window.removeEventListener("focus", onFocus);
+      document.removeEventListener("visibilitychange", onVisibility);
     };
-  }, [expandedPath, refreshExpanded]);
+  }, [projectsReady, projects.length, refreshAllProjects]);
 
+  function clearSelectionIfProject(project: Project) {
+    const sel = selectionRef.current;
+    if (!sel) return;
+    if (sel.path === project.path || project.worktrees.includes(sel.path)) {
+      onSelect(null);
+      return;
+    }
+    const entry = treesRef.current[project.path];
+    if (!entry) return;
+    if (entry.root?.path === sel.path) {
+      onSelect(null);
+      return;
+    }
+    if (entry.extras.some((w) => w.path === sel.path)) {
+      onSelect(null);
+    }
+  }
+
+  function rootPathFor(projectPath: string): string {
+    return treesRef.current[projectPath]?.root?.path ?? projectPath;
+  }
 
   async function handleAddProject() {
     setError(null);
@@ -199,91 +322,193 @@ export function ProjectSidebar({ selection, onSelect }: ProjectSidebarProps) {
 
     try {
       const project = await invoke<Project>("validate_project", { path });
-      setProjects((prev) => [...prev, project]);
+      setProjects((prev) => [...prev, { ...project, worktrees: [] }]);
     } catch (e) {
       setError(String(e));
     }
   }
 
-  function toggleProject(projectPath: string) {
-    const closing = expandedPath === projectPath;
-    const tab: ProjectTab = activeTab[projectPath] ?? "worktrees";
+  function handleProjectClick(projectPath: string) {
+    onSelect({ kind: "worktree", path: rootPathFor(projectPath) });
+    void loadWorktrees(projectPath, { silent: true });
+  }
 
-    flushSync(() => {
-      if (closing) {
-        setExpandedPath(null);
-        setLoadingWorktrees((prev) => ({ ...prev, [projectPath]: false }));
-        setLoadingBranches((prev) => ({ ...prev, [projectPath]: false }));
-        return;
-      }
+  function handleAddWorktree(worktree: Worktree) {
+    if (!addForProject) return;
+    const projectPath = addForProject.path;
 
-      // Accordion: only one project open.
-      setExpandedPath(projectPath);
-      setActiveTab((prev) => ({ ...prev, [projectPath]: tab }));
-
-      if (tab === "branches") {
-        setLoadingBranches((prev) => ({ ...prev, [projectPath]: true }));
-        setLoadingWorktrees((prev) => ({ ...prev, [projectPath]: false }));
-      } else {
-        setLoadingWorktrees((prev) => ({ ...prev, [projectPath]: true }));
-        setLoadingBranches((prev) => ({ ...prev, [projectPath]: false }));
-      }
-    });
-
-    if (closing) return;
-
-    if (tab === "branches") {
-      const hasCache = Object.prototype.hasOwnProperty.call(
-        branchesRef.current,
-        projectPath,
-      );
-      void loadBranches(projectPath, { silent: hasCache });
+    if (
+      worktree.path === projectPath ||
+      worktree.path === rootPathFor(projectPath)
+    ) {
+      setAddForProject(null);
+      onSelect({ kind: "worktree", path: worktree.path });
+      void loadWorktrees(projectPath, { silent: true });
       return;
     }
 
-    const hasCache = Object.prototype.hasOwnProperty.call(
-      worktreesRef.current,
-      projectPath,
-    );
-    void loadWorktrees(projectPath, { silent: hasCache });
+    const nextExtras = addForProject.worktrees.includes(worktree.path)
+      ? extraPathsFor(addForProject)
+      : [...extraPathsFor(addForProject), worktree.path];
+
+    setProjects((prev) => {
+      const next = prev.map((p) =>
+        p.path === projectPath ? { ...p, worktrees: nextExtras } : p,
+      );
+      projectsRef.current = next;
+      return next;
+    });
+
+    setAddForProject(null);
+    onSelect({ kind: "worktree", path: worktree.path });
+    void loadWorktrees(projectPath, {
+      silent: true,
+      extraPaths: nextExtras,
+    });
   }
 
+  function closeWorktreeFromList(projectPath: string, worktreePath: string) {
+    if (
+      worktreePath === projectPath ||
+      worktreePath === rootPathFor(projectPath)
+    ) {
+      return;
+    }
 
+    const project = projectsRef.current.find((p) => p.path === projectPath);
+    if (!project) return;
 
-  function selectTab(projectPath: string, tab: ProjectTab) {
-    if (expandedPath !== projectPath) return;
+    const nextExtras = extraPathsFor(project).filter((p) => p !== worktreePath);
 
-    setActiveTab((prev) => ({ ...prev, [projectPath]: tab }));
-
-    if (tab === "worktrees") {
-      const hasCache = Object.prototype.hasOwnProperty.call(
-        worktreesRef.current,
-        projectPath,
+    setProjects((prev) => {
+      const next = prev.map((p) =>
+        p.path === projectPath ? { ...p, worktrees: nextExtras } : p,
       );
-      flushSync(() => {
-        setLoadingWorktrees((prev) => ({ ...prev, [projectPath]: true }));
+      projectsRef.current = next;
+      return next;
+    });
+
+    setTrees((prev) => {
+      const entry = prev[projectPath];
+      if (!entry) return prev;
+      return {
+        ...prev,
+        [projectPath]: {
+          ...entry,
+          extras: entry.extras.filter((w) => w.path !== worktreePath),
+        },
+      };
+    });
+
+    if (selectionRef.current?.path === worktreePath) {
+      onSelect({ kind: "worktree", path: rootPathFor(projectPath) });
+    }
+  }
+
+  async function deleteWorktree(projectPath: string, worktreePath: string) {
+    if (
+      worktreePath === projectPath ||
+      worktreePath === rootPathFor(projectPath)
+    ) {
+      return;
+    }
+
+    const confirmed = window.confirm(
+      `Delete worktree from git?\n\n${worktreePath}\n\nThis removes the worktree directory.`,
+    );
+    if (!confirmed) return;
+
+    setError(null);
+    try {
+      await invoke("remove_worktree", {
+        repo: projectPath,
+        path: worktreePath,
+        force: true,
       });
-      void loadWorktrees(projectPath, { silent: hasCache });
-      return;
+      closeWorktreeFromList(projectPath, worktreePath);
+    } catch (e) {
+      setError(String(e));
     }
-
-    const hasCache = Object.prototype.hasOwnProperty.call(
-      branchesRef.current,
-      projectPath,
-    );
-    flushSync(() => {
-      setLoadingBranches((prev) => ({ ...prev, [projectPath]: true }));
-    });
-    void loadBranches(projectPath, { silent: hasCache });
   }
 
+  function closeProject(project: Project) {
+    clearSelectionIfProject(project);
+
+    setProjects((prev) => {
+      const next = prev.filter((p) => p.path !== project.path);
+      projectsRef.current = next;
+      return next;
+    });
+
+    setTrees((prev) => {
+      const next = { ...prev };
+      delete next[project.path];
+      return next;
+    });
+  }
+
+  function openProjectMenu(e: React.MouseEvent, project: Project) {
+    e.preventDefault();
+    e.stopPropagation();
+    setMenu({
+      x: e.clientX,
+      y: e.clientY,
+      items: [
+        {
+          id: "open-worktree",
+          label: "Open worktree",
+          onClick: () => setAddForProject(project),
+        },
+        {
+          id: "close-project",
+          label: "Close",
+          onClick: () => closeProject(project),
+        },
+      ],
+    });
+  }
+
+  function openWorktreeMenu(
+    e: React.MouseEvent,
+    project: Project,
+    wt: Worktree,
+  ) {
+    e.preventDefault();
+    e.stopPropagation();
+
+    setMenu({
+      x: e.clientX,
+      y: e.clientY,
+      items: [
+        {
+          id: "close-worktree",
+          label: "Close",
+          onClick: () => closeWorktreeFromList(project.path, wt.path),
+        },
+        {
+          id: "delete-worktree",
+          label: "Delete",
+          danger: true,
+          onClick: () => {
+            void deleteWorktree(project.path, wt.path);
+          },
+        },
+      ],
+    });
+  }
 
   return (
     <aside className="sidebar">
       <header className="sidebar-header">
         <h1 className="sidebar-title">Projects</h1>
-        <button type="button" className="add-project-btn" onClick={handleAddProject}>
-          Add Project
+        <button
+          type="button"
+          className="icon-btn"
+          onClick={handleAddProject}
+          aria-label="Add project"
+          title="Add project"
+        >
+          <FolderPlus size={16} strokeWidth={1.75} aria-hidden />
         </button>
       </header>
 
@@ -295,200 +520,100 @@ export function ProjectSidebar({ selection, onSelect }: ProjectSidebarProps) {
         )}
 
         {projects.map((project) => {
-          const isOpen = expandedPath === project.path;
-          const tab = activeTab[project.path] ?? "worktrees";
+          const entry = trees[project.path];
+          const root = entry?.root ?? null;
+          const extras = entry?.extras ?? [];
           const wtLoading = !!loadingWorktrees[project.path];
-          const brLoading = !!loadingBranches[project.path];
-          const hasWtCache = Object.prototype.hasOwnProperty.call(
-            worktrees,
-            project.path,
-          );
-          const hasBrCache = Object.prototype.hasOwnProperty.call(
-            branches,
-            project.path,
-          );
-          const wtList = worktrees[project.path] ?? [];
-          const brList = branches[project.path] ?? [];
-          const isLoading = tab === "worktrees" ? wtLoading : brLoading;
+          const hasCache = project.path in trees;
+          const branch = branchLabel(root);
+          const rootSelected =
+            selection?.kind === "worktree" &&
+            !!root &&
+            selection.path === root.path;
 
           return (
             <li key={project.path} className="project-item">
-              <button
-                type="button"
-                className="project-row"
-                onClick={() => toggleProject(project.path)}
-                title={project.path}
+              <div
+                className={`project-row-wrap${rootSelected ? " selected" : ""}`}
+                onContextMenu={(e) => openProjectMenu(e, project)}
               >
-                <span className={`chevron ${isOpen ? "open" : ""}`} aria-hidden>
-                  ▶
-                </span>
-                <span className="project-name">{project.name}</span>
-                {isOpen && isLoading && <Spinner label="Loading" />}
-              </button>
+                <button
+                  type="button"
+                  className="project-row"
+                  onClick={() => handleProjectClick(project.path)}
+                  onContextMenu={(e) => openProjectMenu(e, project)}
+                  title={project.path}
+                >
+                  <span className="project-folder-icon" aria-hidden>
+                    <Folder size={14} strokeWidth={1.75} />
+                  </span>
+                  <span className="project-name">{project.name}</span>
+                  {branch && (
+                    <span className="project-branch">({branch})</span>
+                  )}
+                  {wtLoading && !hasCache && <Spinner label="Loading" />}
+                </button>
+                <button
+                  type="button"
+                  className="icon-btn project-add-worktree"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setAddForProject(project);
+                  }}
+                  aria-label={`Add worktree to ${project.name}`}
+                  title="Add worktree"
+                >
+                  <FolderTree size={14} strokeWidth={1.75} aria-hidden />
+                </button>
+              </div>
 
-              {isOpen && (
+              {extras.length > 0 && (
                 <div className="project-body">
-                  <div className="project-tabs" role="tablist">
-                    <button
-                      type="button"
-                      role="tab"
-                      aria-selected={tab === "worktrees"}
-                      className={`project-tab ${tab === "worktrees" ? "active" : ""}`}
-                      onClick={() => selectTab(project.path, "worktrees")}
-                    >
-                      Worktrees
-                    </button>
-                    <button
-                      type="button"
-                      role="tab"
-                      aria-selected={tab === "branches"}
-                      className={`project-tab ${tab === "branches" ? "active" : ""}`}
-                      onClick={() => selectTab(project.path, "branches")}
-                    >
-                      Branches
-                    </button>
-                  </div>
-
-                  {tab === "worktrees" && (
-                    <ul className="worktree-list" role="tabpanel">
-                      {!hasWtCache && wtLoading && (
-                        <li className="worktree-meta worktree-loading">
-                          <Spinner label="Loading worktrees" />
-                          <span>Loading worktrees…</span>
-                        </li>
-                      )}
-                      {hasWtCache && wtLoading && wtList.length === 0 && (
-                        <li className="worktree-meta worktree-loading">
-                          <Spinner label="Refreshing worktrees" />
-                          <span>Refreshing…</span>
-                        </li>
-                      )}
-                      {hasWtCache && wtList.length === 0 && !wtLoading && (
-                        <li className="worktree-meta">No worktrees</li>
-                      )}
-                      {hasWtCache &&
-                        wtList.map((wt) => {
-                          const selected =
-                            selection?.kind === "worktree" &&
-                            selection.path === wt.path;
-                          const classes = [
-                            "worktree-item",
-                            selected ? "selected" : "",
-                            wt.hasChanges ? "has-changes" : "",
-                            wt.hasStash ? "has-stash" : "",
-                            !wt.hasChanges && !wt.hasStash ? "clean" : "",
-                          ]
-                            .filter(Boolean)
-                            .join(" ");
-
-                          const status = [
-                            wt.hasChanges ? "uncommitted changes" : null,
-                            wt.hasStash ? "stashed changes" : null,
-                          ]
-                            .filter(Boolean)
-                            .join(", ");
-
-                          return (
-                            <li key={wt.path}>
-                              <button
-                                type="button"
-                                className={classes}
-                                title={status ? `${wt.path} (${status})` : wt.path}
-                                onClick={() =>
-                                  onSelect({ kind: "worktree", path: wt.path })
-                                }
-                                aria-selected={selected}
-                              >
-                                <span className="worktree-name">{wt.name}</span>
-                                <span className="worktree-markers" aria-hidden>
-                                  {wt.hasChanges && (
-                                    <span
-                                      className="marker changes"
-                                      title="Uncommitted changes"
-                                    >
-                                      ●
-                                    </span>
-                                  )}
-                                  {wt.hasStash && (
-                                    <span className="marker stash" title="Stashed changes">
-                                      ▤
-                                    </span>
-                                  )}
-                                </span>
-                              </button>
-                            </li>
-                          );
-                        })}
-
-                    </ul>
-                  )}
-
-                  {tab === "branches" && (
-                    <ul className="branch-list" role="tabpanel">
-                      {!hasBrCache && brLoading && (
-                        <li className="worktree-meta worktree-loading">
-                          <Spinner label="Loading branches" />
-                          <span>Loading branches…</span>
-                        </li>
-                      )}
-                      {hasBrCache && brLoading && brList.length === 0 && (
-                        <li className="worktree-meta worktree-loading">
-                          <Spinner label="Refreshing branches" />
-                          <span>Refreshing…</span>
-                        </li>
-                      )}
-                      {hasBrCache && brList.length === 0 && !brLoading && (
-                        <li className="worktree-meta">No branches</li>
-                      )}
-                      {hasBrCache &&
-                        brList.map((branch) => {
-                          const selected =
-                            selection?.kind === "branch" &&
-                            selection.name === branch.name &&
-                            selection.projectPath === project.path;
-                          const classes = [
-                            "branch-item",
-                            selected ? "selected" : "",
-                            branch.isCurrent ? "current" : "",
-                            branch.isRemote ? "remote" : "local",
-                          ]
-                            .filter(Boolean)
-                            .join(" ");
-
-                          return (
-                            <li
-                              key={`${branch.isRemote ? "r" : "l"}:${branch.name}`}
-                            >
-                              <button
-                                type="button"
-                                className={classes}
-                                title={branch.name}
-                                onClick={() =>
-                                  onSelect({
-                                    kind: "branch",
-                                    name: branch.name,
-                                    projectPath: project.path,
-                                  })
-                                }
-                                aria-selected={selected}
-                              >
-                                <span className="branch-name">{branch.name}</span>
-                                {branch.isCurrent && (
-                                  <span className="branch-current-tag">current</span>
-                                )}
-                              </button>
-                            </li>
-                          );
-                        })}
-
-                    </ul>
-                  )}
+                  <ul className="worktree-list">
+                    {extras.map((wt) => (
+                      <WorktreeRow
+                        key={wt.path}
+                        wt={wt}
+                        project={project}
+                        selected={
+                          selection?.kind === "worktree" &&
+                          selection.path === wt.path
+                        }
+                        onSelect={(path) =>
+                          onSelect({ kind: "worktree", path })
+                        }
+                        onContextMenu={openWorktreeMenu}
+                      />
+                    ))}
+                  </ul>
                 </div>
               )}
             </li>
           );
         })}
       </ul>
+
+      {addForProject && (
+        <AddWorktreeModal
+          projectPath={addForProject.path}
+          projectName={addForProject.name}
+          addedPaths={[
+            rootPathFor(addForProject.path),
+            ...extraPathsFor(addForProject),
+          ]}
+          onAdd={handleAddWorktree}
+          onClose={() => setAddForProject(null)}
+        />
+      )}
+
+      {menu && (
+        <ContextMenu
+          x={menu.x}
+          y={menu.y}
+          items={menu.items}
+          onClose={() => setMenu(null)}
+        />
+      )}
     </aside>
   );
 }

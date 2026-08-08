@@ -1,6 +1,7 @@
 export type Project = {
   path: string;
   name: string;
+  worktrees: string[];
 };
 
 export type Worktree = {
@@ -12,17 +13,7 @@ export type Worktree = {
   hasStash: boolean;
 };
 
-export type Branch = {
-  name: string;
-  isCurrent: boolean;
-  isRemote: boolean;
-};
-
-export type ProjectTab = "worktrees" | "branches";
-
-export type Selection =
-  | { kind: "worktree"; path: string }
-  | { kind: "branch"; name: string; projectPath: string };
+export type Selection = { kind: "worktree"; path: string };
 
 export type Commit = {
   id: string;

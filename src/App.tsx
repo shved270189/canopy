@@ -26,13 +26,6 @@ function App() {
     };
   }, []);
 
-  const topbarLabel =
-    selection?.kind === "worktree"
-      ? selection.path
-      : selection?.kind === "branch"
-        ? selection.name
-        : null;
-
   if (!storageReady) {
     return (
       <div className="app-shell">
@@ -51,7 +44,10 @@ function App() {
       >
         <Panel defaultSize={22} minSize={14} maxSize={45}>
           <div className="panel-fill">
-            <ProjectSidebar selection={selection} onSelect={setSelection} />
+            <ProjectSidebar
+              selection={selection}
+              onSelect={setSelection}
+            />
           </div>
         </Panel>
 
@@ -60,26 +56,18 @@ function App() {
         <Panel defaultSize={78} minSize={40}>
           <div className="panel-fill">
             <main className="main-pane">
-              {topbarLabel ? (
+              {selection ? (
                 <>
-                  <header className="main-topbar" title={topbarLabel}>
-                    <span className="main-path">{topbarLabel}</span>
+                  <header className="main-topbar" title={selection.path}>
+                    <span className="main-path">{selection.path}</span>
                   </header>
-                  {selection?.kind === "worktree" ? (
-                    <WorktreeReview
-                      worktreePath={selection.path}
-                      panelStorage={panelStorage}
-                    />
-                  ) : (
-                    <p className="main-placeholder">
-                      Branch view — select a worktree to review changes
-                    </p>
-                  )}
+                  <WorktreeReview
+                    worktreePath={selection.path}
+                    panelStorage={panelStorage}
+                  />
                 </>
               ) : (
-                <p className="main-placeholder">
-                  Select a worktree or branch to review
-                </p>
+                <p className="main-placeholder">Select a worktree to review</p>
               )}
             </main>
           </div>
