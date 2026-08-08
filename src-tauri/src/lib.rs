@@ -954,7 +954,18 @@ fn load_committed_image_bytes(
     let rev_path = format!("{commit}:{file}");
     match git_blob_bytes(repo, &rev_path) {
         Ok(bytes) => Ok((bytes, "committed".into())),
-        Err(_) => {
+        Err(error) => {
+            let path_exists = match git(
+                repo,
+                &["ls-tree", "-r", "--name-only", commit, "--", file],
+            ) {
+                Ok(paths) => !paths.trim().is_empty(),
+                Err(_) => return Err(error),
+            };
+            if path_exists {
+                return Err(error);
+            }
+
             let parent_ref = format!("{commit}^");
             let parent = git(repo, &["rev-parse", &parent_ref])?;
             let parent_path = format!("{}:{file}", parent.trim());
