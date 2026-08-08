@@ -51,6 +51,27 @@ function splitTrees(
   return { root, extras };
 }
 
+function worktreeEqual(a: Worktree, b: Worktree): boolean {
+  return (
+    a.path === b.path &&
+    a.name === b.name &&
+    a.branch === b.branch &&
+    a.head === b.head &&
+    a.hasChanges === b.hasChanges &&
+    a.hasStash === b.hasStash
+  );
+}
+
+function treesEqual(a: ProjectTrees, b: ProjectTrees): boolean {
+  if (a.root === null || b.root === null) {
+    if (a.root !== b.root) return false;
+  } else if (!worktreeEqual(a.root, b.root)) {
+    return false;
+  }
+  if (a.extras.length !== b.extras.length) return false;
+  return a.extras.every((wt, i) => worktreeEqual(wt, b.extras[i]));
+}
+
 function extraPathsFor(project: Project): string[] {
   return project.worktrees.filter((path) => path !== project.path);
 }
@@ -176,13 +197,20 @@ export function ProjectSidebar({ selection, onSelect }: ProjectSidebarProps) {
     void saveProjects(projects).catch((e) => setError(String(e)));
   }, [projects, projectsReady]);
 
+  const applyTrees = useCallback((projectPath: string, next: ProjectTrees) => {
+    setTrees((prev) => {
+      const cur = prev[projectPath];
+      if (cur && treesEqual(cur, next)) return prev;
+      return { ...prev, [projectPath]: next };
+    });
+  }, []);
+
   const loadWorktrees = useCallback(
     async (
       projectPath: string,
-      options?: { silent?: boolean; extraPaths?: string[]; withStatus?: boolean },
+      options?: { silent?: boolean; extraPaths?: string[] },
     ) => {
       const silent = options?.silent ?? false;
-      const withStatus = options?.withStatus ?? true;
       if (!silent) {
         setError(null);
       }
@@ -193,38 +221,26 @@ export function ProjectSidebar({ selection, onSelect }: ProjectSidebarProps) {
         (project ? extraPathsFor(project) : []);
 
       try {
-        const basic = await invoke<Worktree[]>("list_worktrees", {
+        // One fetch with status — avoids clean→dirty marker flash on poll.
+        const full = await invoke<Worktree[]>("list_worktrees_with_status", {
           path: projectPath,
         });
-        setTrees((prev) => ({
-          ...prev,
-          [projectPath]: splitTrees(basic, projectPath, extras),
-        }));
-        setLoadingWorktrees((prev) => ({ ...prev, [projectPath]: false }));
-
-        if (withStatus) {
-          const full = await invoke<Worktree[]>("list_worktrees_with_status", {
-            path: projectPath,
-          });
-          setTrees((prev) => ({
-            ...prev,
-            [projectPath]: splitTrees(full, projectPath, extras),
-          }));
-        }
+        applyTrees(projectPath, splitTrees(full, projectPath, extras));
       } catch (e) {
         if (!silent) {
           setError(String(e));
         }
         if (!(projectPath in treesRef.current)) {
-          setTrees((prev) => ({
-            ...prev,
-            [projectPath]: { root: null, extras: [] },
-          }));
+          applyTrees(projectPath, { root: null, extras: [] });
         }
-        setLoadingWorktrees((prev) => ({ ...prev, [projectPath]: false }));
+      } finally {
+        setLoadingWorktrees((prev) => {
+          if (!prev[projectPath]) return prev;
+          return { ...prev, [projectPath]: false };
+        });
       }
     },
-    [],
+    [applyTrees],
   );
 
   const refreshAllProjects = useCallback(async () => {
@@ -236,7 +252,7 @@ export function ProjectSidebar({ selection, onSelect }: ProjectSidebarProps) {
         if (loadingWorktreesRef.current[project.path]) {
           return Promise.resolve();
         }
-        return loadWorktrees(project.path, { silent: true, withStatus: true });
+        return loadWorktrees(project.path, { silent: true });
       }),
     );
   }, [loadWorktrees]);

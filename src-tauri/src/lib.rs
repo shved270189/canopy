@@ -513,7 +513,132 @@ fn commit_changes(path: String, message: String) -> Result<(), String> {
     Ok(())
 }
 
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncStatus {
+    pub branch: Option<String>,
+    pub ahead: u32,
+    pub behind: u32,
+    pub can_push: bool,
+    pub can_pull: bool,
+}
 
+fn current_branch(repo: &Path) -> Result<Option<String>, String> {
+    let name = git(repo, &["rev-parse", "--abbrev-ref", "HEAD"])?
+        .trim()
+        .to_string();
+    if name.is_empty() || name == "HEAD" {
+        return Ok(None);
+    }
+    Ok(Some(name))
+}
+
+fn has_origin(repo: &Path) -> bool {
+    git(repo, &["remote", "get-url", "origin"]).is_ok()
+}
+
+fn remote_branch_exists(repo: &Path, branch: &str) -> bool {
+    let reference = format!("refs/remotes/origin/{branch}");
+    git_output(repo, &["show-ref", "--verify", "--quiet", &reference])
+        .map(|(code, _, _)| code == 0)
+        .unwrap_or(false)
+}
+
+fn parse_ahead_behind(output: &str) -> (u32, u32) {
+    let mut parts = output.split_whitespace();
+    let ahead = parts
+        .next()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(0);
+    let behind = parts
+        .next()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(0);
+    (ahead, behind)
+}
+
+#[tauri::command]
+fn remote_sync_status(path: String) -> Result<SyncStatus, String> {
+    let repo = PathBuf::from(&path);
+    let branch = current_branch(&repo)?;
+
+    let Some(branch) = branch else {
+        return Ok(SyncStatus {
+            branch: None,
+            ahead: 0,
+            behind: 0,
+            can_push: false,
+            can_pull: false,
+        });
+    };
+
+    if !has_origin(&repo) {
+        return Ok(SyncStatus {
+            branch: Some(branch),
+            ahead: 0,
+            behind: 0,
+            can_push: false,
+            can_pull: false,
+        });
+    }
+
+    if !remote_branch_exists(&repo, &branch) {
+        // New local branch — pushable if HEAD exists.
+        let has_head = git_output(&repo, &["rev-parse", "--verify", "HEAD"])
+            .map(|(code, _, _)| code == 0)
+            .unwrap_or(false);
+        return Ok(SyncStatus {
+            branch: Some(branch),
+            ahead: if has_head { 1 } else { 0 },
+            behind: 0,
+            can_push: has_head,
+            can_pull: false,
+        });
+    }
+
+    let remote = format!("origin/{branch}");
+    let range = format!("HEAD...{remote}");
+    let counts = git(
+        &repo,
+        &["rev-list", "--left-right", "--count", &range],
+    )?;
+    let (ahead, behind) = parse_ahead_behind(counts.trim());
+
+    Ok(SyncStatus {
+        branch: Some(branch),
+        ahead,
+        behind,
+        can_push: ahead > 0,
+        can_pull: behind > 0,
+    })
+}
+
+#[tauri::command]
+fn push_origin(path: String) -> Result<(), String> {
+    let repo = PathBuf::from(&path);
+    if !has_origin(&repo) {
+        return Err("remote origin not configured".into());
+    }
+    let branch = current_branch(&repo)?.ok_or_else(|| "detached HEAD".to_string())?;
+
+    if remote_branch_exists(&repo, &branch) {
+        git(&repo, &["push", "origin", "HEAD"])?;
+    } else {
+        git(&repo, &["push", "-u", "origin", "HEAD"])?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn pull_origin(path: String) -> Result<(), String> {
+    let repo = PathBuf::from(&path);
+    if !has_origin(&repo) {
+        return Err("remote origin not configured".into());
+    }
+    let branch = current_branch(&repo)?.ok_or_else(|| "detached HEAD".to_string())?;
+    git(&repo, &["pull", "--ff-only", "origin", &branch])?;
+    Ok(())
+}
 
 fn image_mime(path: &str) -> Option<&'static str> {
     let ext = Path::new(path)
@@ -796,6 +921,9 @@ pub fn run() {
             stage_files,
             unstage_files,
             commit_changes,
+            remote_sync_status,
+            push_origin,
+            pull_origin,
             file_preview,
             file_diff,
             load_projects,
@@ -859,6 +987,13 @@ detached
         assert!(worktree_has_stash(&Some("main".into()), &stashed));
         assert!(!worktree_has_stash(&Some("other".into()), &stashed));
         assert!(!worktree_has_stash(&None, &stashed));
+    }
+
+    #[test]
+    fn parse_ahead_behind_counts() {
+        assert_eq!(parse_ahead_behind("2\t1\n"), (2, 1));
+        assert_eq!(parse_ahead_behind("0 3"), (0, 3));
+        assert_eq!(parse_ahead_behind(""), (0, 0));
     }
 }
 

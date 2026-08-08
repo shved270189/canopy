@@ -37,6 +37,14 @@ export type WorktreeStatus = {
   hasChanges: boolean;
 };
 
+export type SyncStatus = {
+  branch: string | null;
+  ahead: number;
+  behind: number;
+  canPush: boolean;
+  canPull: boolean;
+};
+
 export type SelectedFile = {
   path: string;
   staged: boolean;

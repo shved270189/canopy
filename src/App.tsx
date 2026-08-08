@@ -57,15 +57,10 @@ function App() {
           <div className="panel-fill">
             <main className="main-pane">
               {selection ? (
-                <>
-                  <header className="main-topbar" title={selection.path}>
-                    <span className="main-path">{selection.path}</span>
-                  </header>
-                  <WorktreeReview
-                    worktreePath={selection.path}
-                    panelStorage={panelStorage}
-                  />
-                </>
+                <WorktreeReview
+                  worktreePath={selection.path}
+                  panelStorage={panelStorage}
+                />
               ) : (
                 <p className="main-placeholder">Select a worktree to review</p>
               )}

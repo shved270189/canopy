@@ -6,11 +6,13 @@ import {
   PanelResizeHandle,
   type PanelGroupStorage,
 } from "react-resizable-panels";
+import { ArrowDownToLine, ArrowUpFromLine, GitCommitHorizontal } from "lucide-react";
 import type {
   Commit,
   FilePreview,
   SelectedFile,
   StatusFile,
+  SyncStatus,
   WorktreeStatus,
 } from "../types";
 
@@ -19,6 +21,14 @@ import { DiffView } from "./DiffView";
 import { StatusFileSection } from "./StatusFiles";
 
 const REFRESH_MS = 10000;
+
+const EMPTY_SYNC: SyncStatus = {
+  branch: null,
+  ahead: 0,
+  behind: 0,
+  canPush: false,
+  canPull: false,
+};
 
 type WorktreeReviewProps = {
   worktreePath: string;
@@ -32,6 +42,7 @@ export function WorktreeReview({ worktreePath, panelStorage }: WorktreeReviewPro
     unstaged: [],
     hasChanges: false,
   });
+  const [sync, setSync] = useState<SyncStatus>(EMPTY_SYNC);
   const [selectedFile, setSelectedFile] = useState<SelectedFile | null>(null);
   const [preview, setPreview] = useState<FilePreview | null>(null);
   const [loadingGraph, setLoadingGraph] = useState(true);
@@ -44,39 +55,115 @@ export function WorktreeReview({ worktreePath, panelStorage }: WorktreeReviewPro
   const [commitMessage, setCommitMessage] = useState("");
   const [commitBusy, setCommitBusy] = useState(false);
   const [commitError, setCommitError] = useState<string | null>(null);
+  const [pushBusy, setPushBusy] = useState(false);
+  const [pullBusy, setPullBusy] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
 
-  const refreshStatus = useCallback(async (): Promise<WorktreeStatus | null> => {
-    setLoadingStatus(true);
+  const refreshSync = useCallback(async () => {
     try {
-      const next = await invoke<WorktreeStatus>("worktree_status", {
+      const next = await invoke<SyncStatus>("remote_sync_status", {
         path: worktreePath,
       });
-      setStatus(next);
-      setError(null);
-      return next;
-    } catch (e) {
-      setError(String(e));
-      return null;
-    } finally {
-      setLoadingStatus(false);
+      setSync((prev) =>
+        prev.branch === next.branch &&
+        prev.ahead === next.ahead &&
+        prev.behind === next.behind &&
+        prev.canPush === next.canPush &&
+        prev.canPull === next.canPull
+          ? prev
+          : next,
+      );
+    } catch {
+      setSync((prev) =>
+        prev === EMPTY_SYNC ||
+        (!prev.branch &&
+          prev.ahead === 0 &&
+          prev.behind === 0 &&
+          !prev.canPush &&
+          !prev.canPull)
+          ? prev
+          : EMPTY_SYNC,
+      );
     }
   }, [worktreePath]);
 
+  const refreshStatus = useCallback(
+    async (options?: { silent?: boolean }): Promise<WorktreeStatus | null> => {
+      const silent = options?.silent ?? false;
+      if (!silent) setLoadingStatus(true);
+      try {
+        const next = await invoke<WorktreeStatus>("worktree_status", {
+          path: worktreePath,
+        });
+        setStatus((prev) => {
+          if (
+            prev.hasChanges === next.hasChanges &&
+            prev.staged.length === next.staged.length &&
+            prev.unstaged.length === next.unstaged.length &&
+            prev.staged.every(
+              (f, i) =>
+                f.path === next.staged[i]?.path &&
+                f.status === next.staged[i]?.status &&
+                f.staged === next.staged[i]?.staged,
+            ) &&
+            prev.unstaged.every(
+              (f, i) =>
+                f.path === next.unstaged[i]?.path &&
+                f.status === next.unstaged[i]?.status &&
+                f.staged === next.unstaged[i]?.staged,
+            )
+          ) {
+            return prev;
+          }
+          return next;
+        });
+        if (!silent) setError(null);
+        return next;
+      } catch (e) {
+        if (!silent) setError(String(e));
+        return null;
+      } finally {
+        if (!silent) setLoadingStatus(false);
+      }
+    },
+    [worktreePath],
+  );
 
-  const refreshCommits = useCallback(async () => {
-    setLoadingGraph(true);
-    try {
-      const list = await invoke<Commit[]>("list_commits", {
-        path: worktreePath,
-        limit: 80,
-      });
-      setCommits(list);
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setLoadingGraph(false);
-    }
-  }, [worktreePath]);
+  const refreshCommits = useCallback(
+    async (options?: { silent?: boolean }) => {
+      const silent = options?.silent ?? false;
+      if (!silent) setLoadingGraph(true);
+      try {
+        const list = await invoke<Commit[]>("list_commits", {
+          path: worktreePath,
+          limit: 80,
+        });
+        setCommits((prev) => {
+          if (
+            prev.length === list.length &&
+            prev.every(
+              (c, i) =>
+                c.id === list[i]?.id &&
+                c.subject === list[i]?.subject &&
+                c.shortId === list[i]?.shortId &&
+                c.author === list[i]?.author &&
+                c.date === list[i]?.date &&
+                c.refs.length === list[i]?.refs.length &&
+                c.refs.every((r, j) => r === list[i]?.refs[j]),
+            )
+          ) {
+            return prev;
+          }
+          return list;
+        });
+      } catch (e) {
+        if (!silent) setError(String(e));
+      } finally {
+        if (!silent) setLoadingGraph(false);
+      }
+    },
+    [worktreePath],
+  );
 
   const loadDiff = useCallback(
     async (file: SelectedFile) => {
@@ -106,19 +193,21 @@ export function WorktreeReview({ worktreePath, panelStorage }: WorktreeReviewPro
     setCommitOpen(false);
     setCommitMessage("");
     setCommitError(null);
+    setActionError(null);
+    setSync(EMPTY_SYNC);
     void refreshCommits();
     void refreshStatus();
-  }, [worktreePath, refreshCommits, refreshStatus]);
-
-
+    void refreshSync();
+  }, [worktreePath, refreshCommits, refreshStatus, refreshSync]);
 
   useEffect(() => {
     const id = window.setInterval(() => {
-      void refreshStatus();
-      void refreshCommits();
+      void refreshStatus({ silent: true });
+      void refreshCommits({ silent: true });
+      void refreshSync();
     }, REFRESH_MS);
     return () => window.clearInterval(id);
-  }, [refreshStatus, refreshCommits]);
+  }, [refreshStatus, refreshCommits, refreshSync]);
 
   useEffect(() => {
     if (!selectedFile) {
@@ -127,7 +216,6 @@ export function WorktreeReview({ worktreePath, panelStorage }: WorktreeReviewPro
     }
     void loadDiff(selectedFile);
   }, [selectedFile, loadDiff]);
-
 
   async function handleToggleStage(file: StatusFile) {
     setBusyStage(true);
@@ -144,11 +232,10 @@ export function WorktreeReview({ worktreePath, panelStorage }: WorktreeReviewPro
         await invoke("stage_file", { path: worktreePath, file: file.path });
       }
 
-      const next = await refreshStatus();
+      const next = await refreshStatus({ silent: true });
       if (!next) return;
 
       if (wasStaged) {
-        // Unstaged: prefer next remaining staged, else first unstaged.
         if (next.staged.length > 0) {
           const idx =
             sourceIndex < 0
@@ -162,7 +249,6 @@ export function WorktreeReview({ worktreePath, panelStorage }: WorktreeReviewPro
           setSelectedFile(null);
         }
       } else if (next.unstaged.length > 0) {
-        // Staged: prefer next remaining unstaged, else first staged.
         const idx =
           sourceIndex < 0
             ? 0
@@ -181,13 +267,17 @@ export function WorktreeReview({ worktreePath, panelStorage }: WorktreeReviewPro
     }
   }
 
-  async function handleCommit() {
-    if (!commitOpen) {
-      setCommitOpen(true);
-      setCommitError(null);
+  function openCommitPanel() {
+    if (commitOpen) {
+      handleCommitCancel();
       return;
     }
+    setCommitOpen(true);
+    setCommitError(null);
+    setActionError(null);
+  }
 
+  async function handleCommit() {
     const message = commitMessage.trim();
     if (!message) {
       setCommitError("Enter a commit message");
@@ -205,8 +295,9 @@ export function WorktreeReview({ worktreePath, panelStorage }: WorktreeReviewPro
       setCommitMessage("");
       setSelectedFile(null);
       setPreview(null);
-      await refreshStatus();
-      await refreshCommits();
+      await refreshStatus({ silent: true });
+      await refreshCommits({ silent: true });
+      await refreshSync();
     } catch (e) {
       setCommitError(String(e));
     } finally {
@@ -218,6 +309,35 @@ export function WorktreeReview({ worktreePath, panelStorage }: WorktreeReviewPro
     setCommitOpen(false);
     setCommitMessage("");
     setCommitError(null);
+  }
+
+  async function handlePush() {
+    setPushBusy(true);
+    setActionError(null);
+    try {
+      await invoke("push_origin", { path: worktreePath });
+      await refreshSync();
+      await refreshCommits({ silent: true });
+    } catch (e) {
+      setActionError(String(e));
+    } finally {
+      setPushBusy(false);
+    }
+  }
+
+  async function handlePull() {
+    setPullBusy(true);
+    setActionError(null);
+    try {
+      await invoke("pull_origin", { path: worktreePath });
+      await refreshSync();
+      await refreshCommits({ silent: true });
+      await refreshStatus({ silent: true });
+    } catch (e) {
+      setActionError(String(e));
+    } finally {
+      setPullBusy(false);
+    }
   }
 
   async function handleToggleAll(staged: boolean) {
@@ -234,11 +354,10 @@ export function WorktreeReview({ worktreePath, panelStorage }: WorktreeReviewPro
         await invoke("stage_files", { path: worktreePath, files: paths });
       }
 
-      const next = await refreshStatus();
+      const next = await refreshStatus({ silent: true });
       if (!next) return;
 
       if (staged) {
-        // All unstaged → select first unstaged (or first remaining staged).
         if (next.unstaged.length > 0) {
           setSelectedFile({ path: next.unstaged[0].path, staged: false });
         } else if (next.staged.length > 0) {
@@ -247,7 +366,6 @@ export function WorktreeReview({ worktreePath, panelStorage }: WorktreeReviewPro
           setSelectedFile(null);
         }
       } else if (next.staged.length > 0) {
-        // All staged → select first staged.
         setSelectedFile({ path: next.staged[0].path, staged: true });
       } else if (next.unstaged.length > 0) {
         setSelectedFile({ path: next.unstaged[0].path, staged: false });
@@ -261,68 +379,99 @@ export function WorktreeReview({ worktreePath, panelStorage }: WorktreeReviewPro
     }
   }
 
-
-
   const canCommit = status.staged.length > 0;
+  const actionBusy = commitBusy || pushBusy || pullBusy || busyStage;
+  const canPush = sync.canPush && !actionBusy;
+  const canPull = sync.canPull && !actionBusy;
 
   return (
     <div className="worktree-review">
-      {error && <p className="review-error">{error}</p>}
-
-      <div className="commit-float">
-        {commitOpen && (
-          <div className="commit-popover" role="dialog" aria-label="Commit changes">
-            <label className="commit-label" htmlFor="commit-message">
-              Commit message
-            </label>
-            <textarea
-              id="commit-message"
-              className="commit-textarea"
-              value={commitMessage}
-              onChange={(e) => setCommitMessage(e.target.value)}
-              placeholder="Describe your changes…"
-              rows={4}
-              autoFocus
-              disabled={commitBusy}
-            />
-            {commitError && <p className="commit-error">{commitError}</p>}
-            <div className="commit-actions">
-              <button
-                type="button"
-                className="commit-btn secondary"
-                onClick={handleCommitCancel}
-                disabled={commitBusy}
-              >
-                Cancel
-              </button>
-              <button
-                type="button"
-                className="commit-btn primary"
-                onClick={() => void handleCommit()}
-                disabled={commitBusy || !commitMessage.trim()}
-              >
-                {commitBusy ? "Committing…" : "Commit"}
-              </button>
-            </div>
-          </div>
-        )}
-
-        {!commitOpen && (
-          <button
-            type="button"
-            className="commit-btn primary commit-fab"
-            onClick={() => void handleCommit()}
-            disabled={!canCommit || busyStage}
-            title={
-              canCommit
-                ? `Commit ${status.staged.length} staged file(s)`
-                : "Stage files to commit"
-            }
-          >
-            Commit{canCommit ? ` (${status.staged.length})` : ""}
-          </button>
-        )}
+      <div className="git-actions-bar">
+        <button
+          type="button"
+          className={`git-action-btn${commitOpen ? " active" : ""}`}
+          onClick={openCommitPanel}
+          disabled={!canCommit || actionBusy}
+        >
+          <GitCommitHorizontal size={15} strokeWidth={1.75} aria-hidden />
+          <span>Commit{canCommit ? ` (${status.staged.length})` : ""}</span>
+        </button>
+        <button
+          type="button"
+          className="git-action-btn"
+          onClick={() => void handlePush()}
+          disabled={!canPush}
+        >
+          <ArrowUpFromLine size={15} strokeWidth={1.75} aria-hidden />
+          <span>
+            {pushBusy
+              ? "Pushing…"
+              : sync.ahead > 0
+                ? `Push (${sync.ahead})`
+                : "Push"}
+          </span>
+        </button>
+        <button
+          type="button"
+          className="git-action-btn"
+          onClick={() => void handlePull()}
+          disabled={!canPull}
+        >
+          <ArrowDownToLine size={15} strokeWidth={1.75} aria-hidden />
+          <span>
+            {pullBusy
+              ? "Pulling…"
+              : sync.behind > 0
+                ? `Pull (${sync.behind})`
+                : "Pull"}
+          </span>
+        </button>
       </div>
+
+      <header className="main-topbar" title={worktreePath}>
+        <span className="main-path">{worktreePath}</span>
+      </header>
+
+      {commitOpen && (
+        <div className="commit-panel" role="dialog" aria-label="Commit changes">
+          <label className="commit-label" htmlFor="commit-message">
+            Commit message
+          </label>
+          <textarea
+            id="commit-message"
+            className="commit-textarea"
+            value={commitMessage}
+            onChange={(e) => setCommitMessage(e.target.value)}
+            placeholder="Describe your changes…"
+            rows={3}
+            autoFocus
+            disabled={commitBusy}
+          />
+          {commitError && <p className="commit-error">{commitError}</p>}
+          <div className="commit-actions">
+            <button
+              type="button"
+              className="commit-btn secondary"
+              onClick={handleCommitCancel}
+              disabled={commitBusy}
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              className="commit-btn primary"
+              onClick={() => void handleCommit()}
+              disabled={commitBusy || !commitMessage.trim()}
+            >
+              {commitBusy ? "Committing…" : "Commit"}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {(error || actionError) && (
+        <p className="review-error">{error || actionError}</p>
+      )}
 
       <PanelGroup
         direction="vertical"
@@ -330,7 +479,6 @@ export function WorktreeReview({ worktreePath, panelStorage }: WorktreeReviewPro
         storage={panelStorage}
         className="review-panels"
       >
-        {/* Default: graph 1/3, review 2/3 */}
         <Panel defaultSize={33.33} minSize={15}>
           <div className="panel-fill">
             <CommitGraph
@@ -351,7 +499,6 @@ export function WorktreeReview({ worktreePath, panelStorage }: WorktreeReviewPro
               storage={panelStorage}
               className="review-panels"
             >
-              {/* Default: files 1/2, diff 1/2 */}
               <Panel defaultSize={50} minSize={20}>
                 <div className="panel-fill">
                   <PanelGroup
@@ -360,7 +507,6 @@ export function WorktreeReview({ worktreePath, panelStorage }: WorktreeReviewPro
                     storage={panelStorage}
                     className="review-panels files-pane"
                   >
-                    {/* Default: staged 1/2, unstaged 1/2 */}
                     <Panel defaultSize={50} minSize={15}>
                       <div className="panel-fill">
                         <StatusFileSection
@@ -392,7 +538,6 @@ export function WorktreeReview({ worktreePath, panelStorage }: WorktreeReviewPro
                           onToggleAll={() => void handleToggleAll(false)}
                           onSelectFile={setSelectedFile}
                         />
-
                       </div>
                     </Panel>
                   </PanelGroup>
@@ -409,16 +554,12 @@ export function WorktreeReview({ worktreePath, panelStorage }: WorktreeReviewPro
                     loading={loadingDiff}
                     error={diffError}
                   />
-
                 </div>
               </Panel>
             </PanelGroup>
           </div>
         </Panel>
       </PanelGroup>
-
-
     </div>
   );
 }
-
